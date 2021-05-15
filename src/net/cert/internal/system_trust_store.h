@@ -115,7 +115,7 @@ NET_EXPORT std::unique_ptr<SystemTrustStore> CreateSslSystemTrustStore();
 
 #if BUILDFLAG(CHROME_ROOT_STORE_SUPPORTED)
 #if BUILDFLAG(USE_NSS_SERVER_CERTS) || BUILDFLAG(IS_MAC) || \
-    BUILDFLAG(IS_WIN) || BUILDFLAG(IS_ANDROID)
+    BUILDFLAG(IS_WIN) || BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_LINUX)
 // Creates an instance of SystemTrustStore that wraps the current platform's SSL
 // trust store for user added roots, but uses the Chrome Root Store trust
 // anchors. This cannot return nullptr.
