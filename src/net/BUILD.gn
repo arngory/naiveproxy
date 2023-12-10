@@ -154,9 +154,7 @@ source_set("chrome_root_store_data") {
   ]
   if (chrome_root_store_supported || is_fuchsia) {
     deps += [ "//net/data/ssl/chrome_root_store:gen_root_store_inc" ]
-    if (!is_android) {
-      sources += [ "cert/ev_root_ca_metadata_data.cc" ]
-    }
+    sources += [ "cert/ev_root_ca_metadata_data.cc" ]
   }
   if (chrome_root_store_supported) {
     sources += [ "cert/internal/trust_store_chrome_data.cc" ]
@@ -1387,7 +1385,6 @@ component("net") {
       "android/network_library.h",
       "android/traffic_stats.h",
       "cert/cert_verify_proc_android.h",
-      "cert/test_root_certs_android.cc",
       "proxy_resolution/proxy_config_service_android.h",
       "ssl/ech_mode_getter_android.cc",
       "ssl/ech_mode_getter_android.h",
