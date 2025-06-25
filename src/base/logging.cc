@@ -35,7 +35,6 @@
 #include "base/functional/callback.h"
 #include "base/immediate_crash.h"
 #include "base/logging/logging_settings.h"
-#include "base/logging/rust_logger/lib.rs.h"
 #include "base/no_destructor.h"
 #include "base/path_service.h"
 #include "base/pending_task.h"
@@ -508,10 +507,6 @@ bool BaseInitLoggingImpl(const LoggingSettings& settings) {
   }
 #endif
 
-  // Connects Rust logging with the //base logging functionality.
-  internal::init_rust_logging();
-  internal::update_rust_log_level(g_min_log_level);
-
   // Ignore file options unless logging to file is set.
   if ((g_logging_destination & LOG_TO_FILE) == 0) {
     return true;
@@ -549,7 +544,6 @@ bool BaseInitLoggingImpl(const LoggingSettings& settings) {
 
 void SetMinLogLevel(int level) {
   g_min_log_level = std::min(LOGGING_FATAL, level);
-  internal::update_rust_log_level(g_min_log_level);
 }
 
 int GetMinLogLevel() {
