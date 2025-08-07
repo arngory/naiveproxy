@@ -16,9 +16,12 @@ import("../../../../gn/perfetto.gni")
 import("../../../../gn/test.gni")
 
 source_set("graph_processor") {
+  # cold_sort is compiled into this target instead of depending on
+  # "../../util:cold_sort": loading //third_party/perfetto/src/trace_processor/util
+  # pulls in the rest of the trace processor, which is disabled here.
   deps = [
     "../../../../gn:default_deps",
-    "../../util:cold_sort",
+    "../../../base",
   ]
   public_deps = [
     "../../../../include/perfetto/base",
@@ -26,6 +29,8 @@ source_set("graph_processor") {
     "../../../../include/perfetto/ext/trace_processor/importers/memory_tracker",
   ]
   sources = [
+    "../../util/cold_sort.cc",
+    "../../util/cold_sort.h",
     "graph.cc",
     "graph_processor.cc",
     "memory_allocator_node_id.cc",
