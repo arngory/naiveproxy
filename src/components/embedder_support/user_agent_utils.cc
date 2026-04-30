@@ -28,7 +28,6 @@
 #include "components/embedder_support/switches.h"
 #include "components/version_info/version_info.h"
 #include "net/http/http_util.h"
-#include "third_party/blink/public/common/features.h"
 #include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
 
 #if BUILDFLAG(IS_WIN)
@@ -42,13 +41,62 @@
 #include "base/mac/mac_util.h"
 #endif
 
-#if BUILDFLAG(IS_IOS) || BUILDFLAG(IS_ANDROID)
+#if BUILDFLAG(IS_IOS)
 #include "ui/base/device_form_factor.h"
 #endif
 
 #if BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC)
 #include <sys/utsname.h>
 #endif
+
+#include <algorithm>
+#include <utility>
+
+#include "base/containers/span.h"
+#include "base/containers/to_vector.h"
+#include "base/pickle.h"
+#include "net/http/structured_headers.h"
+
+namespace blink {
+
+UserAgentBrandVersion::UserAgentBrandVersion(const std::string& ua_brand,
+                                             const std::string& ua_version) {
+  brand = ua_brand;
+  version = ua_version;
+}
+
+namespace {
+
+std::string SerializeBrandVersionList(
+    const blink::UserAgentBrandList& ua_brand_version_list) {
+  const net::structured_headers::List brand_version_header = base::ToVector(
+      ua_brand_version_list, [](const UserAgentBrandVersion& brand_version) {
+        net::structured_headers::Parameters params;
+        if (!brand_version.version.empty()) {
+          params.emplace_back("v", net::structured_headers::Item(
+                                       net::structured_headers::Item::string,
+                                       brand_version.version));
+        }
+        return net::structured_headers::ParameterizedMember(
+            net::structured_headers::Item(net::structured_headers::Item::string,
+                                          brand_version.brand),
+            std::move(params));
+      });
+
+  return net::structured_headers::SerializeList(brand_version_header)
+      .value_or("");
+}
+
+}  // namespace
+
+std::string UserAgentMetadata::SerializeBrandFullVersionList() const {
+  return SerializeBrandVersionList(brand_full_version_list);
+}
+
+std::string UserAgentMetadata::SerializeBrandMajorVersionList() const {
+  return SerializeBrandVersionList(brand_version_list);
+}
+}
 
 namespace embedder_support {
 
@@ -191,8 +239,7 @@ const blink::UserAgentBrandList GetUserAgentBrandMajorVersionListInternal(
 // It helps us avoid introducing individual enterprise policy controls for
 // sending unified platform for the user agent string.
 bool ShouldSendUserAgentUnifiedPlatform() {
-  return base::FeatureList::IsEnabled(
-      blink::features::kReduceUserAgentMinorVersion);
+  return true;
 }
 
 // Return UserAgentBrandList with the full version populated in the brand
@@ -276,7 +323,7 @@ std::string GetUserAgentPlatform() {
 }
 
 std::string GetUnifiedPlatform() {
-#if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_CHROMEOS)
+#if BUILDFLAG(IS_CHROMEOS)
   // This constant is only used on Android (desktop) and Linux.
   constexpr char kUnifiedPlatformChromeOSX64[] = "X11; CrOS x86_64 14541.0.0";
 
@@ -286,10 +333,7 @@ std::string GetUnifiedPlatform() {
   // form factor.
   if (base::android::device_info::is_desktop() ||
       base::android::device_info::is_xr()) {
-    return base::FeatureList::IsEnabled(
-               blink::features::kAndroidDesktopUASpoofAsChromeOS)
-               ? kUnifiedPlatformChromeOSX64
-               : "X11; Linux x86_64";
+    return "X11; Linux x86_64";
   }
   return "Linux; Android 10; K";
 #elif BUILDFLAG(IS_CHROMEOS)
@@ -464,10 +508,7 @@ std::string GetUserAgentInternal() {
 }  // namespace
 
 std::string GetProductAndVersion() {
-  return base::FeatureList::IsEnabled(
-             blink::features::kReduceUserAgentMinorVersion)
-             ? version_info::GetProductNameAndVersionForReducedUserAgent()
-             : version_info::GetProductNameAndVersionForUserAgent();
+  return version_info::GetProductNameAndVersionForReducedUserAgent();
 }
 
 std::optional<std::string> GetUserAgentFromCommandLine() {
@@ -580,9 +621,7 @@ std::string GetPlatformVersion() {
   // and the real OS version reported unconditionally.
   // Note: check the feature flag first since it is cheaper than the device
   // info checks.
-  if (!base::FeatureList::IsEnabled(
-          blink::features::kAndroidDesktopUAPlatform) &&
-      (base::android::device_info::is_desktop() ||
+  if ((base::android::device_info::is_desktop() ||
        base::android::device_info::is_xr())) {
     return std::string();
   }
@@ -604,13 +643,7 @@ std::string GetPlatformForUAMetadata() {
 #if BUILDFLAG(IS_ANDROID)
   if (base::android::device_info::is_desktop() ||
       base::android::device_info::is_xr()) {
-    return base::FeatureList::IsEnabled(
-               blink::features::kAndroidDesktopUAPlatform)
-               ? "Android"
-               : (base::FeatureList::IsEnabled(
-                      blink::features::kAndroidDesktopUASpoofAsChromeOS)
-                      ? "Chrome OS"
-                      : "Linux");
+    return "Linux";
   }
 #endif
 
@@ -649,9 +682,7 @@ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
   // blocked by web application firewall software, etc.
   std::optional<std::string> custom_ua = GetUserAgentFromCommandLine();
   if (custom_ua.has_value()) {
-    return base::FeatureList::IsEnabled(blink::features::kUACHOverrideBlank)
-               ? blink::UserAgentMetadata()
-               : metadata;
+    return metadata;
   }
 
   if (only_low_entropy_ch) {
@@ -821,8 +852,7 @@ std::string BuildModelInfo() {
 #if BUILDFLAG(IS_ANDROID)
   // Model information is not exposed on Android desktop unless
   // kAndroidDesktopUAModel is enabled.
-  if (!base::FeatureList::IsEnabled(blink::features::kAndroidDesktopUAModel) &&
-      base::android::device_info::is_desktop()) {
+  if (base::android::device_info::is_desktop()) {
     return std::string();
   }
 
@@ -879,11 +909,7 @@ std::string GetAndroidOSInfo(
 }
 
 std::string GetAndroidDesktopCpuArchitecture() {
-  // TODO(crbug.com/433345971): Avoid hardcoding x86 when flag is disabled.
-  if (base::FeatureList::IsEnabled(blink::features::kAndroidDesktopUACPUArch)) {
-    return GetPosixCpuArchitecture();
-  }
-  return "x86";
+  return GetPosixCpuArchitecture();
 }
 #endif  // BUILDFLAG(IS_ANDROID)
 
