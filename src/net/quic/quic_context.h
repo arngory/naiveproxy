@@ -261,7 +261,10 @@ struct NET_EXPORT QuicParams {
   // If true, QUIC accepts certificate chains that do not end in a known root
   // for every host, as it already does for |origins_to_force_quic_on|. Set
   // by embedders that replace the certificate verifier, because only that
-  // verifier knows which roots the embedder trusts.
+  // verifier knows which roots the embedder trusts, and by embedders that
+  // trust local roots in the default verifier and want QUIC to accept them
+  // as TLS over TCP does. The chain must still verify; only the known-root
+  // requirement is lifted.
   bool allow_unknown_cert_roots = false;
 };
 

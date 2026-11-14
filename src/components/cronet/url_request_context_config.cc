@@ -164,6 +164,9 @@ const char kQuicMigrateSessionsEarlyV2[] = "migrate_sessions_early_v2";
 const char kQuicRetryOnAlternateNetworkBeforeHandshake[] =
     "retry_on_alternate_network_before_handshake";
 const char kQuicHostWhitelist[] = "host_whitelist";
+// Name of boolean to let QUIC accept certificates that chain to a locally
+// trusted root, as TLS over TCP does, and not only to a known root.
+const char kQuicAllowUnknownCertRoots[] = "allow_unknown_cert_roots";
 const char kQuicVersion[] = "quic_version";
 const char kQuicFlags[] = "set_quic_flags";
 const char kRetryWithoutAltSvcOnQuicErrors[] =
@@ -687,6 +690,10 @@ void URLRequestContextConfig::SetContextBuilderExperimentalOptions(
           quic_args.FindInt("initial_session_recv_window_size")
               .value_or(quic_params->initial_session_recv_window_size);
 
+      quic_params->allow_unknown_cert_roots =
+          quic_args.FindBool(kQuicAllowUnknownCertRoots)
+              .value_or(quic_params->allow_unknown_cert_roots);
+
       const std::string* quic_flags = quic_args.FindString(kQuicFlags);
       if (quic_flags) {
         for (const auto& flag :
@@ -1112,9 +1119,12 @@ void URLRequestContextConfig::ConfigureURLRequestContextBuilder(
   // Chrome only accepts QUIC certificates that chain to a known root, and
   // ProofVerifierChromium enforces that. An embedder that installs its own
   // certificate verifier decides itself which roots are trusted, so the
-  // check is lifted for that case only.
-  quic_context->params()->allow_unknown_cert_roots =
-      mock_cert_verifier != nullptr;
+  // check is lifted for that case. An embedder that keeps the default
+  // verifier lifts it with the "allow_unknown_cert_roots" QUIC option, read
+  // above; either one is enough, and neither turns the other off.
+  if (mock_cert_verifier) {
+    quic_context->params()->allow_unknown_cert_roots = true;
+  }
 
   context_builder->set_http_network_session_params(session_params);
   context_builder->set_quic_context(std::move(quic_context));
