@@ -44,6 +44,7 @@
 #include "net/socket/client_socket_pool_manager.h"
 #include "net/socket/custom_client_socket_factory.h"
 #include "net/socket/ssl_client_socket.h"
+#include "net/ssl/ssl_config_service_trust_anchor_ids.h"
 #include "net/ssl/ssl_key_logger_impl.h"
 #include "net/third_party/quiche/src/quiche/http2/core/spdy_protocol.h"
 #include "net/third_party/quiche/src/quiche/quic/core/crypto/crypto_protocol.h"
@@ -56,6 +57,10 @@
 #if BUILDFLAG(ENABLE_REPORTING)
 #include "net/reporting/reporting_policy.h"
 #endif  // BUILDFLAG(ENABLE_REPORTING)
+
+#if BUILDFLAG(IS_ANDROID)
+#include "net/ssl/ech_mode_getter_android.h"
+#endif  // BUILDFLAG(IS_ANDROID)
 
 namespace cronet {
 
@@ -1114,6 +1119,20 @@ void URLRequestContextConfig::ConfigureURLRequestContextBuilder(
 
   if (mock_cert_verifier)
     context_builder->SetCertVerifier(std::move(mock_cert_verifier));
+
+  // URLRequestContextBuilder falls back to SSLConfigServiceDefaults, which
+  // has no TLS Trust Anchor IDs, so the ClientHello would lack the
+  // trust_anchors extension that Chrome sends. Advertise the IDs of the
+  // compiled-in Chrome Root Store like Chrome does. ECH keeps the policy of
+  // the builder's fallback: the platform policy on Android, opportunistic
+  // elsewhere.
+  std::unique_ptr<net::EchModeGetter> ech_mode_getter;
+#if BUILDFLAG(IS_ANDROID)
+  ech_mode_getter = std::make_unique<net::EchModeGetterAndroid>();
+#endif
+  context_builder->set_ssl_config_service(
+      std::make_unique<net::SSLConfigServiceTrustAnchorIDs>(
+          /*no_post_quantum=*/false, std::move(ech_mode_getter)));
 
   // Network-bound contexts must use Chromium's network-binding socket factory.
   // cronet-go does not expose network handles, so custom dialers are installed

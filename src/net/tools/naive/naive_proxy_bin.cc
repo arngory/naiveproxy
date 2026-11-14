@@ -64,7 +64,7 @@
 #include "net/socket/ssl_client_socket.h"
 #include "net/socket/tcp_server_socket.h"
 #include "net/socket/udp_server_socket.h"
-#include "net/ssl/ssl_config_service.h"
+#include "net/ssl/ssl_config_service_trust_anchor_ids.h"
 #include "net/ssl/ssl_key_logger_impl.h"
 #include "net/third_party/quiche/src/quiche/quic/core/quic_versions.h"
 #include "net/tools/naive/naive_command_line.h"
@@ -254,51 +254,11 @@ std::unique_ptr<URLRequestContext> BuildURLRequestContext(
       config.extra_headers,
       std::vector<PaddingType>{PaddingType::kVariant1, PaddingType::kNone}));
 
-  struct MySSLConfigService : public SSLConfigService {
-    SSLContextConfig config;
-
-    explicit MySSLConfigService(bool no_post_quantum) {
-#if BUILDFLAG(CHROME_ROOT_STORE_SUPPORTED)
-      // Copied from chrome/browser/ssl/ssl_config_service_manager.cc
-      if (base::FeatureList::IsEnabled(net::features::kTLSTrustAnchorIDs)) {
-        std::vector<std::vector<uint8_t>> trust_anchor_ids;
-        if (base::FeatureList::IsEnabled(
-                net::features::kNonMtcTrustAnchorIDs)) {
-          base::Extend(trust_anchor_ids,
-                       net::TrustStoreChrome::
-                           GetTrustAnchorIDsFromCompiledInRootStore());
-        }
-        if (base::FeatureList::IsEnabled(net::features::kVerifyMTCs)) {
-          base::Extend(trust_anchor_ids,
-                       net::TrustStoreChrome::
-                           GetTrustedMtcCaIDsFromCompiledInRootStore());
-        }
-        config.trust_anchor_ids =
-            net::x509_util::EncodeTlsRequestedTrustAnchorIDList(
-                std::move(trust_anchor_ids));
-      }
-#endif
-      if (no_post_quantum) {
-        std::erase_if(config.supported_named_groups,
-                      [](const SSLNamedGroupInfo& g) {
-                        return g.group_id == SSL_GROUP_X25519_MLKEM768 ||
-                               g.group_id == SSL_GROUP_MLKEM1024;
-                      });
-      }
-    }
-
-    SSLContextConfig GetSSLContextConfig() override { return config; }
-
-    EchMode GetEchMode(std::string_view) const override {
-      return EchMode::kOpportunistic;
-    }
-
-    bool CanShareConnectionWithClientCerts(std::string_view) const override {
-      return false;
-    }
-  };
+  // Advertises the TLS Trust Anchor IDs of the compiled-in Chrome Root Store
+  // like Chrome does.
   builder.set_ssl_config_service(
-      std::make_unique<MySSLConfigService>(config.no_post_quantum == true));
+      std::make_unique<SSLConfigServiceTrustAnchorIDs>(config.no_post_quantum ==
+                                                       true));
 
   // The QUIC session pool copies these parameters during Build().
   auto quic_context = std::make_unique<QuicContext>();
