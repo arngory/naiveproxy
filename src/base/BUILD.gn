@@ -1257,6 +1257,8 @@ component("base") {
       "files/file_android.h",
       "files/file_util_android.cc",
       "files/scoped_file_android.cc",
+      "memory_coordinator/memory_consumer_android.h",
+      "memory_coordinator/memory_consumer_android_stub.cc",
       "message_loop/message_pump_android.cc",
       "message_loop/message_pump_android.h",
       "os_compat_android.cc",
