@@ -240,7 +240,7 @@ int PreambleGetter::Start(CompletionOnceCallback callback,
   RequestPriority priority = LOWEST;
   if (req.path == "/" || req.ext == "css") {
     priority = HIGHEST;
-  } else if (req.ext == ".js") {
+  } else if (req.ext == "js") {
     priority = LOW;
   }
   // The preamble requests have to be sent through this API instead of regular
