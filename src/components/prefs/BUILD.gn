@@ -56,10 +56,7 @@ component("prefs") {
   defines = [ "COMPONENTS_PREFS_IMPLEMENTATION" ]
 
   deps = []
-  public_deps = [
-    "//base",
-    "//base/i18n:language_tag",
-  ]
+  public_deps = [ "//base" ]
 
   # Android JNI support disabled for cronet-go (native only)
   # Original JNI files require generated headers from Java.
