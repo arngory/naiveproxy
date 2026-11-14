@@ -3,6 +3,7 @@
 # found in the LICENSE file.
 
 import("//build/buildflag_header.gni")
+import("//build/config/cronet/config.gni")
 import("//build/config/features.gni")
 import("//build/config/linux/pkg_config.gni")
 
@@ -11,7 +12,7 @@ buildflag_header("buildflags") {
   flags = [ "USE_DBUS=$use_dbus" ]
 }
 
-if (use_dbus) {
+if (use_dbus && !is_cronet_build) {
   # Note: if your target also depends on //dbus, you don't need to add this
   # config (it will get added automatically if you depend on //dbus).
   pkg_config("dbus") {
