@@ -68,6 +68,8 @@ struct HttpChunkedDecoder::Impl {};
 
 HttpChunkedDecoder::HttpChunkedDecoder() : HttpChunkedDecoder(false) {}
 
+// `use_rust` is ignored for the reason above. The parameter stays so that the
+// header does not differ from Chromium's.
 HttpChunkedDecoder::HttpChunkedDecoder(bool use_rust) {}
 
 HttpChunkedDecoder::~HttpChunkedDecoder() = default;

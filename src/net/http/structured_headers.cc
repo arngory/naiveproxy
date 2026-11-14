@@ -41,6 +41,8 @@ auto ParseAndRecordMetrics(std::string_view time_metric,
 
 }  // namespace
 
+// The Rust parser is not built. This feature is only kept so that code which
+// names it still links. Nothing reads it and the C++ parser is always used.
 BASE_FEATURE(kStructuredHeadersInRust, base::FEATURE_ENABLED_BY_DEFAULT);
 
 namespace {
