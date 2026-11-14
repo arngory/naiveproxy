@@ -150,8 +150,9 @@ void PreambleGetter::AddRootHeaders(HttpRequestHeaders& headers) {
 
   headers.SetHeader(
       "accept",
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/"
-      "webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7");
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,"
+      "image/avif,image/webp,image/apng,*/*;q=0.8,"
+      "application/signed-exchange;v=b3;q=0.7");
 
   headers.SetHeader("sec-fetch-site", "none");
   headers.SetHeader("sec-fetch-mode", "navigate");
@@ -185,7 +186,8 @@ void PreambleGetter::AddHeaders(const std::string& path,
   } else {
     headers.SetHeader(
         "accept",
-        "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8");
+        "image/jxl,image/avif,image/webp,image/apng,image/svg+xml,image/*,"
+        "*/*;q=0.8");
   }
 
   headers.SetHeader("sec-fetch-site", "same-origin");
