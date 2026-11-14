@@ -447,16 +447,16 @@ class TrustStoreUnix : public PlatformTrustStore {
         break;
     }
 
-#if BUILDFLAG(IS_ANDROID)
-    // Reading nothing is the expected state when the environment names
-    // nothing.
-    if (cert_filenames.empty() && cert_dirnames.empty()) {
-      return;
-    }
-#endif
     if (!cert_file_ok && !cert_dir_ok) {
+#if BUILDFLAG(IS_ANDROID)
+      // On Android reading nothing is how an embedder asks for the Chrome Root
+      // Store only: SSL_CERT_FILE unset, or naming an empty or missing file.
+      VLOG(1) << "No CA certificates were read from SSL_CERT_FILE or "
+                 "SSL_CERT_DIR";
+#else
       LOG(ERROR) << "No CA certificates were found. Try using environment "
                     "variable SSL_CERT_FILE or SSL_CERT_DIR";
+#endif
     }
   }
 
