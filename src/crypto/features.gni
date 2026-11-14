@@ -5,14 +5,17 @@
 import("//build/config/cast.gni")
 
 declare_args() {
-  # True if certificates from NSS are used in client authentication.
-  use_nss_client_certs = (is_linux || is_chromeos) && !is_castos
-
-  # True if certificates from NSS are used in server authentication.
-  use_nss_server_certs = is_linux
+  # True if the NSS library is used. Setting this to false also turns off the
+  # two arguments below, so that `use_nss_certs=false` is enough to build
+  # without NSS.
+  use_nss_certs = is_linux || is_chromeos
 }
 
 declare_args() {
-  # True if the NSS library is used.
-  use_nss_certs = use_nss_client_certs || use_nss_server_certs
+  # True if certificates from NSS are used in client authentication.
+  use_nss_client_certs =
+      use_nss_certs && (is_linux || is_chromeos) && !is_castos
+
+  # True if certificates from NSS are used in server authentication.
+  use_nss_server_certs = use_nss_certs && is_linux
 }
