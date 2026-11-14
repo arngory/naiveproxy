@@ -358,6 +358,7 @@ std::unique_ptr<SystemTrustStore> CreateSslSystemTrustStore() {
 
 namespace {
 
+#if !BUILDFLAG(IS_ANDROID)
 // Copied from https://golang.org/src/crypto/x509/root_linux.go
 // Possible certificate files; stop after finding one.
 constexpr std::array<const char*, 6> kStaticRootCertFiles = {
@@ -376,6 +377,7 @@ constexpr std::array<const char*, 3> kStaticRootCertDirs = {
     "/etc/pki/tls/certs",  // Fedora/RHEL
     "/system/etc/security/cacerts",  // Android
 };
+#endif  // !BUILDFLAG(IS_ANDROID)
 
 // The environment variable which identifies where to locate the SSL
 // certificate file. If set this overrides the system default.
@@ -392,8 +394,14 @@ class TrustStoreUnix : public PlatformTrustStore {
   TrustStoreUnix() {
     auto env = base::Environment::Create();
     std::optional<std::string> env_value;
+#if BUILDFLAG(IS_ANDROID)
+    // On Android the system roots are not trusted by default: only the files
+    // and directories named by SSL_CERT_FILE and SSL_CERT_DIR are read.
+    std::vector<std::string> cert_filenames;
+#else
     std::vector<std::string> cert_filenames(kStaticRootCertFiles.begin(),
                                             kStaticRootCertFiles.end());
+#endif
     env_value = env->GetVar(kStaticCertFileEnv);
     if (env_value.has_value() && !env_value->empty()) {
       cert_filenames = {*env_value};
@@ -410,8 +418,12 @@ class TrustStoreUnix : public PlatformTrustStore {
       }
     }
 
+#if BUILDFLAG(IS_ANDROID)
+    std::vector<std::string> cert_dirnames;
+#else
     std::vector<std::string> cert_dirnames(kStaticRootCertDirs.begin(),
                                            kStaticRootCertDirs.end());
+#endif
     env_value = env->GetVar(kStaticCertDirsEnv);
     if (env_value.has_value() && !env_value->empty()) {
       cert_dirnames = base::SplitString(*env_value, ":", base::TRIM_WHITESPACE,
@@ -435,6 +447,13 @@ class TrustStoreUnix : public PlatformTrustStore {
         break;
     }
 
+#if BUILDFLAG(IS_ANDROID)
+    // Reading nothing is the expected state when the environment names
+    // nothing.
+    if (cert_filenames.empty() && cert_dirnames.empty()) {
+      return;
+    }
+#endif
     if (!cert_file_ok && !cert_dir_ok) {
       LOG(ERROR) << "No CA certificates were found. Try using environment "
                     "variable SSL_CERT_FILE or SSL_CERT_DIR";
