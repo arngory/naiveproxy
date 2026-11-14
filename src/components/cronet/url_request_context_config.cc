@@ -1109,6 +1109,13 @@ void URLRequestContextConfig::ConfigureURLRequestContextBuilder(
   SetContextBuilderExperimentalOptions(context_builder, &session_params,
                                        quic_context->params(), bound_network);
 
+  // Chrome only accepts QUIC certificates that chain to a known root, and
+  // ProofVerifierChromium enforces that. An embedder that installs its own
+  // certificate verifier decides itself which roots are trusted, so the
+  // check is lifted for that case only.
+  quic_context->params()->allow_unknown_cert_roots =
+      mock_cert_verifier != nullptr;
+
   context_builder->set_http_network_session_params(session_params);
   context_builder->set_quic_context(std::move(quic_context));
 

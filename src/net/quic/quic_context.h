@@ -257,6 +257,12 @@ struct NET_EXPORT QuicParams {
   // Initial flow control receive window sizes for QUIC.
   int32_t initial_stream_recv_window_size = 6 * 1024 * 1024;   // 6 MB
   int32_t initial_session_recv_window_size = 15 * 1024 * 1024;  // 15 MB
+
+  // If true, QUIC accepts certificate chains that do not end in a known root
+  // for every host, as it already does for |origins_to_force_quic_on|. Set
+  // by embedders that replace the certificate verifier, because only that
+  // verifier knows which roots the embedder trusts.
+  bool allow_unknown_cert_roots = false;
 };
 
 // QuicContext contains QUIC-related variables that are shared across all of the

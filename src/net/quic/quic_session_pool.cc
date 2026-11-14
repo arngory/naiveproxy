@@ -2942,7 +2942,7 @@ QuicSessionPool::CreateCryptoConfigHandle(QuicCryptoClientConfigKey key) {
 
   std::set<std::string> hostnames_to_allow_unknown_roots =
       HostsFromSchemeHostPorts(params_.origins_to_force_quic_on);
-  if (params_.force_quic_everywhere) {
+  if (params_.force_quic_everywhere || params_.allow_unknown_cert_roots) {
     hostnames_to_allow_unknown_roots.insert("");
   }
 
