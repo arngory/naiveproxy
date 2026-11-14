@@ -55,7 +55,6 @@
 #include "base/strings/string_view_util.h"
 #include "net/base/features.h"
 #include "net/base/net_errors.h"
-#include "net/http/http_chunked_decoder.rs.h"
 
 namespace net {
 
@@ -63,19 +62,13 @@ namespace net {
 // extensions.
 const size_t HttpChunkedDecoder::kMaxLineBufLen = 16384;
 
-struct HttpChunkedDecoder::Impl {
-  rust::Box<ffi::HttpChunkedDecoder> decoder = ffi::new_http_chunked_decoder();
-};
+// The Rust implementation is not built. `impl_` stays null and the C++
+// implementation below is always used, whatever kHttpChunkedDecoderInRust says.
+struct HttpChunkedDecoder::Impl {};
 
-HttpChunkedDecoder::HttpChunkedDecoder()
-    : HttpChunkedDecoder(
-          base::FeatureList::IsEnabled(features::kHttpChunkedDecoderInRust)) {}
+HttpChunkedDecoder::HttpChunkedDecoder() : HttpChunkedDecoder(false) {}
 
-HttpChunkedDecoder::HttpChunkedDecoder(bool use_rust) {
-  if (use_rust) {
-    impl_ = std::make_unique<Impl>();
-  }
-}
+HttpChunkedDecoder::HttpChunkedDecoder(bool use_rust) {}
 
 HttpChunkedDecoder::~HttpChunkedDecoder() = default;
 
@@ -84,25 +77,14 @@ HttpChunkedDecoder HttpChunkedDecoder::CreateForTesting(bool use_rust) {
 }
 
 bool HttpChunkedDecoder::reached_eof() const {
-  if (impl_) {
-    return impl_->decoder->reached_eof();
-  }
   return reached_eof_;
 }
 
 int HttpChunkedDecoder::bytes_after_eof() const {
-  if (impl_) {
-    return impl_->decoder->bytes_after_eof();
-  }
   return bytes_after_eof_;
 }
 
 int HttpChunkedDecoder::FilterBuf(base::span<uint8_t> buf) {
-  if (impl_) {
-    int result = impl_->decoder->filter_buf(rust::Slice<uint8_t>(buf));
-    return result < 0 ? ERR_INVALID_CHUNKED_ENCODING : result;
-  }
-
   size_t result = 0;
   while (buf.size() > 0) {
     if (chunk_remaining_ > 0) {
