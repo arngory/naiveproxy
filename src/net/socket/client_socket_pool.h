@@ -369,6 +369,11 @@ class NET_EXPORT ClientSocketPool : public LowerLayeredPool {
   static base::TimeDelta used_idle_socket_timeout();
   static void set_used_idle_socket_timeout(base::TimeDelta timeout);
 
+  // If set, every connection through a proxy uses a CONNECT tunnel, also for
+  // http:// destinations, which Chrome sends to an HTTP proxy without one.
+  // Off by default. The naive binary turns it on.
+  static void set_force_tunnel(bool force_tunnel);
+
   void SetAdditionalCapacityForTest(
       const SocketPoolAdditionalCapacity& additional_capacity) {
     additional_capacity_ = additional_capacity;

@@ -379,6 +379,9 @@ int main(int argc, char* argv[]) {
       net::HttpNetworkSession::SocketPoolType::kNormal,
       kDefaultMaxSocketsPerGroup * kExpectedMaxUsers);
   net::ClientSocketPool::set_used_idle_socket_timeout(base::Seconds(60));
+  // Naive relays raw sockets, which need a CONNECT tunnel even when the
+  // endpoint uses an HTTP scheme.
+  net::ClientSocketPool::set_force_tunnel(true);
   // Chrome only auto-tunes QUIC receive windows on servers. Naive relays
   // bulk traffic, so it lets the client windows grow too.
   SetQuicFlag(quic_client_auto_tune_receive_window, true);

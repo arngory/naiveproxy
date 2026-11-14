@@ -41,6 +41,9 @@ namespace {
 // The maximum duration, in seconds, to keep used idle persistent sockets alive.
 int64_t g_used_idle_socket_timeout_s = 300;  // 5 minutes
 
+// Whether every connection through a proxy uses a CONNECT tunnel.
+bool g_force_tunnel = false;
+
 // Invoked by the transport socket pool after host resolution is complete
 // to allow the connection to be aborted, if a matching SPDY session can
 // be found. Returns OnHostResolutionCallbackResult::kMayBeDeletedAsync if such
@@ -182,6 +185,11 @@ void ClientSocketPool::set_used_idle_socket_timeout(base::TimeDelta timeout) {
   g_used_idle_socket_timeout_s = timeout.InSeconds();
 }
 
+// static
+void ClientSocketPool::set_force_tunnel(bool force_tunnel) {
+  g_force_tunnel = force_tunnel;
+}
+
 ClientSocketPool::ClientSocketPool(
     size_t socket_soft_cap,
     const ProxyChain& proxy_chain,
@@ -237,9 +245,13 @@ std::unique_ptr<ConnectJob> ClientSocketPool::CreateConnectJob(
         is_for_websockets_);
   }
 
+  // Force a CONNECT tunnel for websockets. If this is false, the connect job
+  // may still use a tunnel for other reasons.
+  //
   // Naive requires a CONNECT tunnel for raw sockets, even when the endpoint
-  // uses an HTTP scheme. Keep this independent of WebSocket ALPN and pooling.
-  bool force_tunnel = true;
+  // uses an HTTP scheme, and asks for it with set_force_tunnel(). Keep this
+  // independent of WebSocket ALPN and pooling.
+  bool force_tunnel = is_for_websockets_ || g_force_tunnel;
 
   // Only offer HTTP/1.1 for WebSockets. Although RFC 8441 defines WebSockets
   // over HTTP/2, a single WSS/HTTPS origin may support HTTP over HTTP/2
