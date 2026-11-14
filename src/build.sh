@@ -84,6 +84,12 @@ flags="$flags"'
   use_clang_modules=false
 '
 
+# The naive binary uses PartitionAlloc, as upstream naiveproxy does. The
+# default in build_overrides/partition_alloc.gni turns it off for the Cronet
+# library that cronet-go builds, which does not go through this script.
+flags="$flags"'
+  use_partition_alloc=true'
+
 if [ "$WITH_SYSROOT" ]; then
   flags="$flags
     target_sysroot=\"//$WITH_SYSROOT\""
