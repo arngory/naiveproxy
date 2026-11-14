@@ -67,6 +67,7 @@
 #include "net/ssl/ssl_config_service_trust_anchor_ids.h"
 #include "net/ssl/ssl_key_logger_impl.h"
 #include "net/third_party/quiche/src/quiche/quic/core/quic_versions.h"
+#include "net/third_party/quiche/src/quiche/quic/platform/api/quic_flags.h"
 #include "net/tools/naive/naive_command_line.h"
 #include "net/tools/naive/naive_config.h"
 #include "net/tools/naive/naive_protocol.h"
@@ -378,6 +379,9 @@ int main(int argc, char* argv[]) {
       net::HttpNetworkSession::SocketPoolType::kNormal,
       kDefaultMaxSocketsPerGroup * kExpectedMaxUsers);
   net::ClientSocketPool::set_used_idle_socket_timeout(base::Seconds(60));
+  // Chrome only auto-tunes QUIC receive windows on servers. Naive relays
+  // bulk traffic, so it lets the client windows grow too.
+  SetQuicFlag(quic_client_auto_tune_receive_window, true);
 
   const auto& proc = *base::CommandLine::ForCurrentProcess();
   const auto& args = proc.GetArgs();

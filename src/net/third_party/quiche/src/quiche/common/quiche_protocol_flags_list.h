@@ -290,4 +290,9 @@ QUICHE_PROTOCOL_FLAG(
     uint32_t, quic_buffered_connections_limit, 100,
     "Limit on the number of connections in the buffered packet store.")
 
+QUICHE_PROTOCOL_FLAG(
+    bool, quic_client_auto_tune_receive_window, false,
+    "If true, QUIC clients auto-tune their flow control receive windows the "
+    "way servers do. Chrome leaves this off. The naive binary turns it on.")
+
 #endif
