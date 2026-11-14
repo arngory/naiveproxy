@@ -689,8 +689,8 @@ class QUICHE_EXPORT QuicConnection
   // the peer.
   // In a client, the packet may be "stray" and have a different connection ID
   // than that of this connection.
-  virtual void ProcessUdpPacket(const QuicSocketAddress& self_address,
-                                const QuicSocketAddress& peer_address,
+  virtual void ProcessUdpPacket(const QuicSocketAddress& packet_self_address,
+                                const QuicSocketAddress& packet_peer_address,
                                 const QuicReceivedPacket& packet);
 
   // QuicBlockedWriterInterface
@@ -1364,6 +1364,9 @@ class QUICHE_EXPORT QuicConnection
 
   bool HasUnusedConnectionId() const;
 
+  // Returns the number of unused peer-issued connection IDs.
+  size_t NumUnusedPeerIssuedConnectionIds() const;
+
   QuicPathValidationContext* GetPathValidationContext() const;
 
   // TODO(martinduke): Delete this deprecated method once non-QUICHE callers are
@@ -1537,6 +1540,10 @@ class QUICHE_EXPORT QuicConnection
   // participation guidance.
   bool ShouldEnableSpinBit() const;
 
+  ConnectionIdGeneratorInterface& connection_id_generator() const {
+    return connection_id_generator_;
+  }
+
  protected:
   // Calls cancel() on all the alarms owned by this connection.
   void CancelAllAlarms();
@@ -1553,24 +1560,6 @@ class QUICHE_EXPORT QuicConnection
   // Called when a effective peer address migration is validated.
   virtual void OnEffectivePeerMigrationValidated(bool is_migration_linkable);
 
-  // Get the effective peer address from the packet being processed. For proxied
-  // connections, effective peer address is the address of the endpoint behind
-  // the proxy. For non-proxied connections, effective peer address is the same
-  // as peer address.
-  //
-  // Notes for implementations in subclasses:
-  // - If the connection is not proxied, the overridden method should use the
-  //   base implementation:
-  //
-  //       return QuicConnection::GetEffectivePeerAddressFromCurrentPacket();
-  //
-  // - If the connection is proxied, the overridden method may return either of
-  //   the following:
-  //   a) The address of the endpoint behind the proxy. The address is used to
-  //      drive effective peer migration.
-  //   b) An uninitialized address, meaning the effective peer address does not
-  //      change.
-  virtual QuicSocketAddress GetEffectivePeerAddressFromCurrentPacket() const;
 
   AddressChangeType active_effective_peer_migration_type() const {
     return active_effective_peer_migration_type_;
@@ -1613,10 +1602,6 @@ class QUICHE_EXPORT QuicConnection
     return defer_send_in_response_to_packets_;
   }
 
-  ConnectionIdGeneratorInterface& connection_id_generator() const {
-    return connection_id_generator_;
-  }
-
  private:
   friend class test::QuicConnectionPeer;
 
@@ -1630,7 +1615,7 @@ class QUICHE_EXPORT QuicConnection
     kNotValidated,
     kPendingRefreshValidation,
     kWaitingForRefreshValidation,
-    kMaxValue,
+    kNumStatuses,
   };
 
   struct QUICHE_EXPORT PathState {
@@ -2118,8 +2103,8 @@ class QUICHE_EXPORT QuicConnection
   // once PathState is used in packet creator. Return true if the given self
   // address and peer address is the same as the self address and peer address
   // of the default path.
-  bool IsDefaultPath(const QuicSocketAddress& self_address,
-                     const QuicSocketAddress& peer_address) const;
+  bool IsDefaultPath(const QuicSocketAddress& path_self_address,
+                     const QuicSocketAddress& path_peer_address) const;
 
   // Return true if the |self_address| and |peer_address| is the same as the
   // self address and peer address of the alternative path.
@@ -2598,6 +2583,7 @@ class QUICHE_EXPORT QuicConnection
   // True if spin bit is enabled for this connection.
   bool spin_bit_enabled_ : 1 = false;
   bool fix_mtu_discovery_ : 1 = GetQuicReloadableFlag(quic_fix_mtu_discovery);
+  bool send_acks_after_on_can_write_ : 1 = false;
 };
 
 }  // namespace quic

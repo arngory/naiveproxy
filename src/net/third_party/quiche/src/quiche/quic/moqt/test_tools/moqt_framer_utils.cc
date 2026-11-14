@@ -52,6 +52,9 @@ struct FramingVisitor {
   quiche::QuicheBuffer operator()(const MoqtNamespaceDone& message) {
     return framer.SerializeNamespaceDone(message);
   }
+  quiche::QuicheBuffer operator()(const MoqtPublishSkipped& message) {
+    return framer.SerializePublishSkipped(message);
+  }
   quiche::QuicheBuffer operator()(const MoqtTrackStatus& message) {
     return framer.SerializeTrackStatus(message);
   }
@@ -64,20 +67,11 @@ struct FramingVisitor {
   quiche::QuicheBuffer operator()(const MoqtSubscribeTracks& message) {
     return framer.SerializeSubscribeTracks(message);
   }
-  quiche::QuicheBuffer operator()(const MoqtMaxRequestId& message) {
-    return framer.SerializeMaxRequestId(message);
-  }
   quiche::QuicheBuffer operator()(const MoqtFetch& message) {
     return framer.SerializeFetch(message);
   }
-  quiche::QuicheBuffer operator()(const MoqtFetchCancel& message) {
-    return framer.SerializeFetchCancel(message);
-  }
   quiche::QuicheBuffer operator()(const MoqtFetchOk& message) {
     return framer.SerializeFetchOk(message);
-  }
-  quiche::QuicheBuffer operator()(const MoqtRequestsBlocked& message) {
-    return framer.SerializeRequestsBlocked(message);
   }
   quiche::QuicheBuffer operator()(const MoqtPublish& message) {
     return framer.SerializePublish(message);
@@ -97,9 +91,11 @@ std::string SerializeGenericMessage(const AnyMoqtControlMessage& frame,
   quic::Perspective perspective = quic::Perspective::IS_CLIENT;
   if (std::holds_alternative<MoqtSetup>(frame)) {
     const MoqtSetup& setup = std::get<MoqtSetup>(frame);
-    if (!use_webtrans && !setup.parameters.path.has_value()) {
+    if (!use_webtrans && !setup.options.path.has_value()) {
       perspective = quic::Perspective::IS_SERVER;
     }
+  } else if (std::holds_alternative<MoqtGoAway>(frame)) {
+    perspective = quic::Perspective::IS_SERVER;
   }
   MoqtFramer framer(use_webtrans, perspective);
   return std::string(std::visit(FramingVisitor{framer}, frame).AsStringView());

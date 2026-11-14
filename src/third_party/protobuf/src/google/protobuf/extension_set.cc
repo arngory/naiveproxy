@@ -51,8 +51,9 @@ namespace google {
 namespace protobuf {
 namespace internal {
 
-struct ExtensionSet::LargeMap : public absl::btree_map<int, Extension> {
-  using btree_map::btree_map;
+struct ExtensionSet::LargeRep : public ExtensionSet::LargeRepBase {
+  using LargeMap = absl::btree_map<int, Extension>;
+  LargeMap large;
 };
 namespace {
 
@@ -172,11 +173,16 @@ void ExtensionSet::RegisterMessageExtension(const MessageLite* extendee,
              type == WireFormatLite::TYPE_GROUP);
   ExtensionInfo info(extendee, number, type, is_repeated, is_packed,
                      verify_func, is_lazy);
-  info.message_info = {prototype,
+  info.message_info = {
+#ifdef PROTOBUF_MESSAGE_GLOBALS
+      internal::MessageGlobalsBase::FromDefaultInstance(prototype),
+#else   // PROTOBUF_MESSAGE_GLOBALS
+      prototype,
+#endif  // PROTOBUF_MESSAGE_GLOBALS
 #if defined(PROTOBUF_CONSTINIT_DEFAULT_INSTANCES)
-                       prototype->GetTcParseTable()
+      prototype->GetTcParseTable()
 #else
-                       nullptr
+      nullptr
 #endif
   };
   Register(info);
@@ -190,7 +196,7 @@ ExtensionSet::~ExtensionSet() {
 
   ForEach([](int /* number */, Extension& ext) { ext.Free(); }, PrefetchNta{});
   if (ABSL_PREDICT_FALSE(is_large())) {
-    delete map_.large;
+    delete static_cast<LargeRep*>(map_.large);
   } else {
     DeleteFlatMap(map_.flat, flat_capacity_);
   }
@@ -228,8 +234,17 @@ void ExtensionSet::DeleteFlatMap(const ExtensionSet::KeyValue* flat,
 
 bool ExtensionSet::IsEmpty() const {
   if (IsCompletelyEmpty()) return true;
-  return !AnyOfNoPrefetch(
-      [](const int number, const Extension& ext) { return ext.IsSet(); });
+  if (ABSL_PREDICT_FALSE(is_large())) {
+    auto* large_rep = static_cast<const LargeRep*>(map_.large);
+    for (const auto& kv : large_rep->large) {
+      if (kv.second.IsSet()) return false;
+    }
+    return true;
+  }
+  for (const KeyValue *it = flat_begin(), *end = flat_end(); it != end; ++it) {
+    if (it->second.IsSet()) return false;
+  }
+  return true;
 }
 
 bool ExtensionSet::Has(int number) const {
@@ -636,7 +651,7 @@ MessageLite* ExtensionSet::MutableRepeatedMessage(int number, int index) {
 }
 
 MessageLite* ExtensionSet::AddMessage(Arena* arena, int number, FieldType type,
-                                      const ClassData* class_data,
+                                      const MessageLite& prototype,
                                       const FieldDescriptor* descriptor) {
   Extension* extension;
   if (MaybeNewExtension(arena, number, descriptor, &extension)) {
@@ -649,9 +664,10 @@ MessageLite* ExtensionSet::AddMessage(Arena* arena, int number, FieldType type,
   } else {
     ABSL_DCHECK_TYPE(*extension, REPEATED_FIELD, MESSAGE);
   }
+
   return reinterpret_cast<internal::RepeatedPtrFieldBase*>(
              extension->ptr.repeated_message_value)
-      ->AddFromClassData<GenericTypeHandler<MessageLite>>(arena, class_data);
+      ->AddFromPrototype<GenericTypeHandler<MessageLite>>(arena, &prototype);
 }
 
 // Defined in extension_set_heavy.cc.
@@ -859,9 +875,10 @@ void ExtensionSet::InternalMergeFromSlow(Arena* arena,
       GrowCapacity(arena, SizeOfUnion(flat_begin(), flat_end(),
                                       other.flat_begin(), other.flat_end()));
     } else {
+      auto* other_large = static_cast<const LargeRep*>(other.map_.large);
       GrowCapacity(arena, SizeOfUnion(flat_begin(), flat_end(),
-                                      other.map_.large->begin(),
-                                      other.map_.large->end()));
+                                      other_large->large.begin(),
+                                      other_large->large.end()));
     }
   }
   other.ForEach(
@@ -1111,7 +1128,8 @@ bool ExtensionSet::IsInitialized(Arena* arena,
   // Extensions are never required.  However, we need to check that all
   // embedded messages are initialized.
   if (ABSL_PREDICT_FALSE(is_large())) {
-    for (const auto& kv : *map_.large) {
+    auto* large_rep = static_cast<const LargeRep*>(map_.large);
+    for (const auto& kv : large_rep->large) {
       if (!kv.second.IsInitialized(this, extendee, kv.first, arena)) {
         return false;
       }
@@ -1190,8 +1208,9 @@ uint8_t* ExtensionSet::_InternalSerializeImplLarge(
     const MessageLite* extendee, int start_field_number, int end_field_number,
     uint8_t* target, io::EpsCopyOutputStream* stream) const {
   assert(is_large());
-  const auto& end = map_.large->end();
-  for (auto it = map_.large->lower_bound(start_field_number);
+  auto* large_rep = static_cast<const LargeRep*>(map_.large);
+  const auto& end = large_rep->large.end();
+  for (auto it = large_rep->large.lower_bound(start_field_number);
        it != end && it->first < end_field_number; ++it) {
     target = it->second.InternalSerializeFieldWithCachedSizesToArray(
         extendee, this, it->first, target, stream);
@@ -1439,7 +1458,6 @@ size_t ExtensionSet::Extension::ByteSize(int number) const {
   return result;
 }
 
-
 int ExtensionSet::Extension::GetSize() const {
   ABSL_DCHECK(is_repeated);
   switch (cpp_type(type)) {
@@ -1543,8 +1561,9 @@ const ExtensionSet::Extension* ExtensionSet::FindOrNull(int key) const {
 const ExtensionSet::Extension* ExtensionSet::FindOrNullInLargeMap(
     int key) const {
   assert(is_large());
-  LargeMap::const_iterator it = map_.large->find(key);
-  if (it != map_.large->end()) {
+  auto* large_rep = static_cast<const LargeRep*>(map_.large);
+  auto it = large_rep->large.find(key);
+  if (it != large_rep->large.end()) {
     return &it->second;
   }
   return nullptr;
@@ -1565,42 +1584,26 @@ ABSL_ATTRIBUTE_NOINLINE
 std::pair<ExtensionSet::Extension*, bool>
 ExtensionSet::InternalInsertIntoLargeMap(int key) {
   ABSL_DCHECK(is_large());
-  auto maybe = map_.large->insert({key, Extension()});
+  auto* large_rep = static_cast<LargeRep*>(map_.large);
+  auto maybe = large_rep->large.insert({key, Extension()});
+  if (maybe.second) {
+    ++large_rep->size;
+  }
   return {&maybe.first->second, maybe.second};
-}
-
-size_t ExtensionSet::LargeMapSize() const {
-  return map_.large->size();
-}
-
-void ExtensionSet::ForEachLargeMap(
-    absl::FunctionRef<void(int, Extension&)> func,
-    absl::FunctionRef<void(const void*)> prefetch_func) {
-  ForEachPrefetchImpl(map_.large->begin(), map_.large->end(), func,
-                      prefetch_func);
-}
-
-void ExtensionSet::ForEachLargeMap(
-    absl::FunctionRef<void(int, const Extension&)> func,
-    absl::FunctionRef<void(const void*)> prefetch_func) const {
-  ForEachPrefetchImpl(map_.large->begin(), map_.large->end(), func,
-                      prefetch_func);
 }
 
 void ExtensionSet::ForEachNoPrefetchLargeMap(
     absl::FunctionRef<void(int, Extension&)> func) {
-  ForEachNoPrefetch(map_.large->begin(), map_.large->end(), func);
+  auto* large_rep = static_cast<LargeRep*>(map_.large);
+  ForEachNoPrefetch(large_rep->large.begin(), large_rep->large.end(), func);
 }
 
 void ExtensionSet::ForEachNoPrefetchLargeMap(
     absl::FunctionRef<void(int, const Extension&)> func) const {
-  ForEachNoPrefetch(map_.large->begin(), map_.large->end(), func);
+  auto* large_rep = static_cast<const LargeRep*>(map_.large);
+  ForEachNoPrefetch(large_rep->large.begin(), large_rep->large.end(), func);
 }
 
-bool ExtensionSet::AnyOfNoPrefetchLargeMap(
-    absl::FunctionRef<bool(int, const Extension&)> predicate) const {
-  return AnyOfNoPrefetch(map_.large->begin(), map_.large->end(), predicate);
-}
 
 std::pair<ExtensionSet::Extension*, bool> ExtensionSet::Insert(Arena* arena,
                                                                int key) {
@@ -1652,11 +1655,13 @@ void ExtensionSet::GrowCapacity(Arena* arena, size_t minimum_new_capacity) {
   KeyValue* end = flat_end();
   AllocatedData new_map;
   if (new_flat_capacity > kMaximumFlatCapacity) {
-    new_map.large = Arena::Create<LargeMap>(arena);
-    LargeMap::iterator hint = new_map.large->begin();
+    auto* large_rep = Arena::Create<LargeRep>(arena);
+    auto hint = large_rep->large.begin();
     for (const KeyValue* it = begin; it != end; ++it) {
-      hint = new_map.large->insert(hint, {it->first, it->second});
+      hint = large_rep->large.insert(hint, {it->first, it->second});
     }
+    large_rep->size = end - begin;
+    new_map.large = large_rep;
     flat_size_ = static_cast<uint16_t>(-1);
     ABSL_DCHECK(is_large());
   } else {
@@ -1687,7 +1692,8 @@ void ExtensionSet::InternalReserveSmallCapacityFromEmpty(
 
 void ExtensionSet::Erase(int key) {
   if (ABSL_PREDICT_FALSE(is_large())) {
-    map_.large->erase(key);
+    auto* large_rep = static_cast<LargeRep*>(map_.large);
+    large_rep->size -= large_rep->large.erase(key);
     return;
   }
   KeyValue* end = flat_end();
@@ -1869,7 +1875,7 @@ const MessageLite* ExtensionSet::GetPrototypeForLazyMessage(
           &extension_info, &was_packed_on_wire)) {
     return nullptr;
   }
-  return extension_info.message_info.prototype;
+  return extension_info.message_info.GetPrototype();
 }
 
 uint8_t*
@@ -1946,15 +1952,6 @@ LazyEagerVerifyFnType FindExtensionLazyEagerVerifyFn(
   return nullptr;
 }
 
-
-std::atomic<ExtensionSet::LazyMessageExtension* (*)(Arena * arena)>
-    ExtensionSet::maybe_create_lazy_extension_;
-
-#if defined(PROTOBUF_INTERNAL_DIRECT_LAZY_FIELD_IN_EXTENSION_SET)
-LazyField* ExtensionSet::MaybeCreateLazyExtension(Arena* arena) {
-  return nullptr;
-}
-#endif  // defined(PROTOBUF_INTERNAL_DIRECT_LAZY_FIELD_IN_EXTENSION_SET)
 
 }  // namespace internal
 }  // namespace protobuf

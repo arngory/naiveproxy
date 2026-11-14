@@ -14,8 +14,10 @@
 
 #include "absl/container/btree_map.h"
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "quiche/quic/core/quic_time.h"
+#include "quiche/quic/moqt/moqt_names.h"
 #include "quiche/quic/moqt/moqt_priority.h"
 #include "quiche/quic/moqt/moqt_types.h"
 #include "quiche/common/platform/api/quiche_export.h"
@@ -24,7 +26,7 @@
 
 namespace moqt {
 
-// Encodes a list of key-value pairs common to both parameters and extensions.
+// Encodes a list of key-value pairs common to both Options and Properties.
 // If the key is odd, it is a length-prefixed string (which may encode further
 // item-specific structure). If the key is even, it is a varint.
 // This class does not interpret the semantic meaning of the keys and values.
@@ -49,6 +51,18 @@ class QUICHE_EXPORT KeyValuePairList {
   void clear() { map_.clear(); }
   bool operator==(const KeyValuePairList& other) const = default;
   KeyValuePairList& operator=(const KeyValuePairList& other) = default;
+
+ protected:
+  // Returns the first key in the range [min_key, max_key], or nullopt if
+  // there is no such key.
+  std::optional<uint64_t> first_key_in_range(uint64_t min_key,
+                                             uint64_t max_key) const {
+    auto it = map_.lower_bound(min_key);
+    if (it == map_.end() || it->first > max_key) {
+      return std::nullopt;
+    }
+    return it->first;
+  }
 
  private:
   absl::btree_multimap<uint64_t, std::variant<uint64_t, std::string>> map_;
@@ -111,23 +125,20 @@ class QUICHE_EXPORT SubscriptionFilter {
   }
 
   MoqtFilterType type() const { return type_; }
-  Location start() const { return start_; }
+  Location start() const { return start_.value_or(Location(0, 0)); }
   uint64_t end_group() const { return end_group_; }
   // If true, the filter does not depend on knowing LargestObject, or we
   // already know LargestObject. A Subscriber cannot have an unknown window,
   // because it can't process an object without getting the track alias from
   // the SubscribeOk.
-  bool WindowKnown() const {
-    return type_ == MoqtFilterType::kAbsoluteStart ||
-           type_ == MoqtFilterType::kAbsoluteRange;
-  }
+  bool WindowKnown() const { return start_.has_value(); }
   // Publishers should not call InWindow() if !WindowKnown(), as they should
   // not forward objects without knowing the window.
   bool InWindow(Location location) const {
-    return location >= start_ && location.group <= end_group_;
+    return location >= start() && location.group <= end_group_;
   }
   bool InWindow(uint64_t group) const {
-    return group >= start_.group && group <= end_group_;
+    return (group >= start().group) && group <= end_group_;
   }
   // Update the filter when LargestObject is learned. If the type is
   // LargestObject or NextGroupStart, changes the type to AbsoluteStart.
@@ -137,19 +148,16 @@ class QUICHE_EXPORT SubscriptionFilter {
 
  private:
   MoqtFilterType type_;
-  // These could be std::optional, but it would just add to the class size.
-  Location start_ = Location(0, 0);
+  std::optional<Location> start_;
   uint64_t end_group_ = kMaxGroupId;
 };
 
-// Setup parameters.
-inline constexpr uint64_t kDefaultMaxRequestId = 0;
+// Setup Options.
 // TODO(martinduke): Implement an auth token cache.
 inline constexpr uint64_t kDefaultMaxAuthTokenCacheSize = 0;
 inline constexpr bool kDefaultSupportObjectAcks = false;
-enum class QUICHE_EXPORT SetupParameter : uint64_t {
+enum class QUICHE_EXPORT SetupOption : uint64_t {
   kPath = 0x1,
-  kMaxRequestId = 0x2,
   kAuthorizationToken = 0x3,
   kMaxAuthTokenCacheSize = 0x4,
   kAuthority = 0x5,
@@ -159,17 +167,14 @@ enum class QUICHE_EXPORT SetupParameter : uint64_t {
   // Indicates support for OACK messages.
   kSupportObjectAcks = 0xbbf1438,
 };
-// TODO(martinduke): Refactor this to be more like TrackExtensions.
-struct QUICHE_EXPORT SetupParameters {
-  SetupParameters() = default;
+// TODO(martinduke): Refactor this to be more like TrackProperties.
+struct QUICHE_EXPORT SetupOptions {
+  SetupOptions() = default;
   // Constructors for tests.
-  SetupParameters(absl::string_view path, absl::string_view authority,
-                  uint64_t max_request_id)
-      : path(path), max_request_id(max_request_id), authority(authority) {}
-  SetupParameters(uint64_t max_request_id) : max_request_id(max_request_id) {}
+  SetupOptions(absl::string_view path, absl::string_view authority)
+      : path(path), authority(authority) {}
 
   std::optional<std::string> path;
-  std::optional<uint64_t> max_request_id;
   // TODO(martinduke): Turn authorization_token into structured data.
   std::vector<AuthToken> authorization_tokens;
   std::optional<uint64_t> max_auth_token_cache_size;
@@ -177,7 +182,7 @@ struct QUICHE_EXPORT SetupParameters {
   std::optional<std::string> moqt_implementation;
 
   std::optional<bool> support_object_acks;
-  bool operator==(const SetupParameters& other) const = default;
+  bool operator==(const SetupOptions& other) const = default;
   // Defined in moqt_framer.cc.
   KeyValuePairList ToKeyValuePairList() const;
   // Defined in moqt_parser.cc.
@@ -187,15 +192,19 @@ struct QUICHE_EXPORT SetupParameters {
 };
 
 enum class MessageParameter : uint64_t {
-  kDeliveryTimeout = 0x02,
+  kObjectDeliveryTimeout = 0x02,
   kAuthorizationToken = 0x03,
+  kRendezvousTimeout = 0x04,
+  kSubgroupDeliveryTimeout = 0x06,
   kExpires = 0x08,
   kLargestObject = 0x09,
+  kFillTimeout = 0x0a,
   kForward = 0x10,
   kSubscriberPriority = 0x20,
   kSubscriptionFilter = 0x21,
   kGroupOrder = 0x22,
   kNewGroupRequest = 0x32,
+  kTrackNamespacePrefix = 0x34,
 
   kOackWindowSize = 0xbbF1438,
 };
@@ -203,7 +212,13 @@ constexpr quic::QuicTimeDelta kDefaultDeliveryTimeout =
     quic::QuicTimeDelta::Infinite();
 constexpr quic::QuicTimeDelta kDefaultExpires = quic::QuicTimeDelta::Infinite();
 constexpr bool kDefaultForward = true;
-// TODO(martinduke): Refactor this to be more like TrackExtensions.
+constexpr quic::QuicTimeDelta kDefaultFillTimeout =
+    quic::QuicTimeDelta::Infinite();
+constexpr quic::QuicTimeDelta kDefaultRendezvousTimeout =
+    quic::QuicTimeDelta::Zero();
+// Limit to prevent the publisher from waiting too long for a rendezvous.
+constexpr quic::QuicTimeDelta kMaxRendezvousTimeout =
+    quic::QuicTimeDelta::FromSeconds(30);
 struct MessageParameters {
   MessageParameters() = default;
   MessageParameters(const MessageParameters&) = default;
@@ -219,28 +234,26 @@ struct MessageParameters {
   // with it. Otherwise, leave unchanged.
   void Update(const MessageParameters& other);
 
-  std::optional<quic::QuicTimeDelta> delivery_timeout;
+  std::optional<quic::QuicTimeDelta> subgroup_delivery_timeout;
   std::vector<AuthToken> authorization_tokens;
+  std::optional<quic::QuicTimeDelta> rendezvous_timeout;
+  std::optional<quic::QuicTimeDelta> object_delivery_timeout;
   std::optional<quic::QuicTimeDelta> expires;
   std::optional<Location> largest_object;
+  std::optional<quic::QuicTimeDelta> fill_timeout;
   bool forward() const { return forward_.value_or(kDefaultForward); }
   void set_forward(bool forward) { forward_ = forward; }
+  void clear_forward() { forward_.reset(); }
   bool forward_has_value() const { return forward_.has_value(); }
   std::optional<MoqtPriority> subscriber_priority;
   std::optional<SubscriptionFilter> subscription_filter;
-  std::optional<MoqtDeliveryOrder> group_order;
+  std::optional<MoqtGroupOrder> group_order;
   std::optional<uint64_t> new_group_request;
+  std::optional<TrackNamespace> track_namespace_prefix;
 
   // QUICHE-specific parameters.
   std::optional<quic::QuicTimeDelta> oack_window_size;
   bool operator==(const MessageParameters& other) const = default;
-
-  // Defined in moqt_framer.cc.
-  KeyValuePairList ToKeyValuePairList() const;
-  // Defined in moqt_parser.cc.
-  // If the class is not initialized with the default constructor, it is likely
-  // to return an error if a non-default field duplicates what is in |list|.
-  absl::Status FromKeyValuePairList(const KeyValuePairList& list);
 
  private:
   // "if (forward)" is bug-prone because it returns forward_.has_value(). Make
@@ -248,10 +261,11 @@ struct MessageParameters {
   std::optional<bool> forward_;
 };
 
-enum class ExtensionHeader : uint64_t {
-  kDeliveryTimeout = 0x02,
+enum class PropertyType : uint64_t {
+  kObjectDeliveryTimeout = 0x02,
   kMaxCacheDuration = 0x04,
-  kImmutableExtensions = 0x0b,
+  kSubgroupDeliveryTimeout = 0x06,
+  kImmutableProperties = 0x0b,
   kDefaultPublisherPriority = 0x0e,
   kDefaultPublisherGroupOrder = 0x22,
   kDynamicGroups = 0x30,
@@ -260,48 +274,60 @@ enum class ExtensionHeader : uint64_t {
 };
 inline constexpr quic::QuicTimeDelta kDefaultMaxCacheDuration =
     quic::QuicTimeDelta::Infinite();
-inline constexpr bool kDefaultImmutableExtensions = false;
-inline constexpr MoqtDeliveryOrder kDefaultGroupOrder =
-    MoqtDeliveryOrder::kAscending;
+inline constexpr bool kDefaultImmutableProperties = false;
+inline constexpr MoqtGroupOrder kDefaultGroupOrder = MoqtGroupOrder::kAscending;
 inline constexpr bool kDefaultDynamicGroups = false;
-class TrackExtensions : public KeyValuePairList {
+inline constexpr uint64_t kMinMandatoryTrackProperty = 0x4000;
+inline constexpr uint64_t kMaxMandatoryTrackProperty = 0x7FFF;
+class TrackProperties : public KeyValuePairList {
  public:
-  TrackExtensions() = default;
-  TrackExtensions(const TrackExtensions&) = default;
-  // Constructor for Original publishers to create their extensions.
-  TrackExtensions(std::optional<quic::QuicTimeDelta> delivery_timeout,
+  TrackProperties() = default;
+  TrackProperties(const TrackProperties&) = default;
+  // Constructor for Original publishers to create their track properties.
+  TrackProperties(std::optional<quic::QuicTimeDelta> object_delivery_timeout,
                   std::optional<quic::QuicTimeDelta> max_cache_duration,
+                  std::optional<quic::QuicTimeDelta> subgroup_delivery_timeout,
                   std::optional<MoqtPriority> publisher_priority,
-                  std::optional<MoqtDeliveryOrder> group_order,
+                  std::optional<MoqtGroupOrder> group_order,
                   std::optional<bool> dynamic_groups,
-                  std::optional<absl::string_view> immutable_extensions);
+                  std::optional<absl::string_view> immutable_properties);
 
-  // If present and well-formed, returns the value of the extension. Returns the
+  // If present and well-formed, returns the value of the property. Returns the
   // default value if missing or ill-formed.
-  quic::QuicTimeDelta delivery_timeout() const;
+  quic::QuicTimeDelta object_delivery_timeout() const;
   quic::QuicTimeDelta max_cache_duration() const;
-  absl::string_view immutable_extensions() const;
+  quic::QuicTimeDelta subgroup_delivery_timeout() const;
+  absl::string_view immutable_properties() const;
   MoqtPriority default_publisher_priority() const;
-  MoqtDeliveryOrder default_publisher_group_order() const;
+  MoqtGroupOrder default_publisher_group_order() const;
   bool dynamic_groups() const;
+  bool empty() const { return size() == 0; }
 
-  // Returns false if the extension list contains illegal values or illegally
-  // duplicated extensions.
+  // Returns false if the property list contains illegal values or illegally
+  // duplicated properties.
   bool Validate() const;
-  bool operator==(const TrackExtensions& other) const = default;
-  TrackExtensions& operator=(const TrackExtensions& other) = default;
+  // Returns OK if there are no unknown mandatory properties. Otherwise, returns
+  // an error.
+  absl::Status CheckForUnknownMandatoryProperty() const {
+    std::optional<uint64_t> key = first_key_in_range(
+        kMinMandatoryTrackProperty, kMaxMandatoryTrackProperty);
+    return !key.has_value()
+               ? absl::OkStatus()
+               : absl::FailedPreconditionError(absl::StrCat(
+                     "Unknown mandatory property: 0x", absl::Hex(*key)));
+  }
+  bool operator==(const TrackProperties& other) const = default;
+  TrackProperties& operator=(const TrackProperties& other) = default;
 
  private:
-  // Returns the value of the extension if there is exactly one, otherwise
-  // returns std::nullopt. Must not be called on odd extension types.
-  std::optional<uint64_t> GetValueIfExactlyOne(ExtensionHeader header) const;
-  // Verifies that there is no more that one instance of an extension, and if
+  // Returns the value of the property if there is exactly one, otherwise
+  // returns std::nullopt. Must not be called on odd property types.
+  std::optional<uint64_t> GetValueIfExactlyOne(PropertyType header) const;
+  // Verifies that there is no more that one instance of an property, and if
   // present, that the value is acceptable.
-  bool ValidateInner(ExtensionHeader header, std::optional<uint64_t> min_value,
+  bool ValidateInner(PropertyType header, std::optional<uint64_t> min_value,
                      std::optional<uint64_t> max_value) const;
 };
-
-// TODO(martinduke): Extension Headers (MOQT draft-16 Sec 11)
 
 }  // namespace moqt
 

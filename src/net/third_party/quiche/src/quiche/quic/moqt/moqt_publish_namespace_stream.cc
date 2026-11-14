@@ -15,15 +15,15 @@
 #include "quiche/quic/moqt/moqt_key_value_pair.h"
 #include "quiche/quic/moqt/moqt_messages.h"
 #include "quiche/quic/moqt/moqt_parser.h"
+#include "quiche/common/quiche_status_utils.h"
 
 namespace moqt {
 
 void MoqtPublishNamespaceRequestStream::OnStreamBound() {
   // TODO(martinduke): Set the priority for this stream.
-  SendOrBufferMessageOrFatal(
-      framer()->SerializePublishNamespace(
-          MoqtPublishNamespace{request_id_, prefix_, parameters_}),
-      false);
+  MoqtPublishNamespace message{request_id_, prefix_, parameters_};
+  SendOrBufferMessageOrFatal(framer()->SerializePublishNamespace(message),
+                             false);
   QUIC_DLOG(INFO) << "Sent PUBLISH_NAMESPACE message for " << prefix_;
 }
 
@@ -35,12 +35,27 @@ absl::Status MoqtPublishNamespaceRequestStream::OnRawControlMessage(
 
 absl::Status MoqtPublishNamespaceRequestStream::OnControlMessage(
     const MoqtRequestOk& message) {
+  if (!message.properties.empty()) {
+    OnFatalError(
+        absl::InvalidArgumentError("REQUEST_OK received with properties"));
+    return absl::OkStatus();
+  }
   if (response_callback_ != nullptr) {
     // Response to the initial PUBLISH_NAMESPACE.
+    if (!ParametersAllowedByRequestOk(message.parameters,
+                                      MoqtMessageType::kPublishNamespace)) {
+      return absl::InvalidArgumentError(
+          "REQUEST_OK contains invalid parameters for PUBLISH_NAMESPACE");
+    }
     auto callback = std::move(response_callback_);
     response_callback_ = nullptr;
     std::move(callback)(message.parameters);
     return absl::OkStatus();
+  }
+  if (!ParametersAllowedByRequestOk(message.parameters,
+                                    MoqtMessageType::kRequestUpdate)) {
+    return absl::InvalidArgumentError(
+        "REQUEST_OK contains invalid parameters for REQUEST_UPDATE");
   }
   absl::StatusOr<MessageParameters> old_parameters =
       request_update_queue().NextParameters();
@@ -55,15 +70,24 @@ absl::Status MoqtPublishNamespaceRequestStream::OnControlMessage(
 absl::Status MoqtPublishNamespaceRequestStream::OnControlMessage(
     const MoqtRequestError& message) {
   if (response_callback_ != nullptr) {
+    if (!RedirectAllowedByRequestError(message.redirect,
+                                       MoqtMessageType::kPublishNamespace)) {
+      return absl::InvalidArgumentError(
+          "REQUEST_ERROR contains invalid redirect for PUBLISH_NAMESPACE");
+    }
     // Response to the initial PUBLISH_NAMESPACE.
     auto callback = std::move(response_callback_);
     response_callback_ = nullptr;
     Fin();
-    std::move(callback)(MoqtRequestErrorInfo{
-        message.error_code, message.retry_interval, message.reason_phrase});
+    std::move(callback)(message);
     return absl::OkStatus();
   }
   // The REQUEST_ERROR is a response to the REQUEST_UPDATE message.
+  if (!RedirectAllowedByRequestError(message.redirect,
+                                     MoqtMessageType::kRequestUpdate)) {
+    return absl::InvalidArgumentError(
+        "REQUEST_ERROR contains invalid redirect for REQUEST_UPDATE");
+  }
   absl::Status status = request_update_queue().OnControlMessage(message);
   if (status.ok()) {
     Fin();
@@ -90,62 +114,71 @@ absl::Status MoqtPublishNamespaceResponseStream::OnControlMessage(
   if (add_callback_ == nullptr) {
     return absl::InvalidArgumentError("Two PUBLISH_NAMESPACE on one stream");
   }
+  QUICHE_RETURN_IF_ERROR(validate_request_id_(message.request_id));
+  if (message.track_namespace.DoesNotExist()) {
+    add_callback_ = nullptr;
+    remove_callback_ = nullptr;
+    return SendRequestError(RequestErrorCode::kDoesNotExist,
+                            /*retry_interval=*/std::nullopt,
+                            "Reserved track namespace");
+  }
   request_id_ = message.request_id;
   if (!std::move(add_callback_)(message.track_namespace, this)) {
     add_callback_ = nullptr;
-    return SendRequestError(request_id_, RequestErrorCode::kInternalError,
-                            std::nullopt, "", /*fin=*/true);
+    return SendRequestError(RequestErrorCode::kInternalError, std::nullopt, "");
   }
   add_callback_ = nullptr;
   prefix_ = message.track_namespace;
   application_(
       *prefix_, &message.parameters,
-      [weakptr = weak_ptr_factory_.Create(), id = request_id_](
+      [weakptr = weak_ptr_factory_.Create()](
           std::variant<MessageParameters, MoqtRequestErrorInfo> response) {
         MoqtPublishNamespaceResponseStream* stream = weakptr.GetIfAvailable();
         if (stream == nullptr) {
           return;
         }
-        std::visit(
-            absl::Overload{[&](const MessageParameters& parameters) {
-                             stream->CheckStatus(
-                                 stream->SendRequestOk(id, parameters));
-                           },
-                           [&](const MoqtRequestErrorInfo& error) {
-                             stream->CheckStatus(stream->SendRequestError(
-                                 id, error.error_code, error.retry_interval,
-                                 error.reason_phrase));
-                           }},
-            response);
+        std::visit(absl::Overload{
+                       [&](const MessageParameters& parameters) {
+                         stream->CheckStatus(stream->SendRequestOk(
+                             parameters, MoqtMessageType::kPublishNamespace));
+                       },
+                       [&](const MoqtRequestErrorInfo& error) {
+                         stream->CheckStatus(stream->SendRequestError(error));
+                       }},
+                   response);
       });
   return absl::OkStatus();
 }
 
 absl::Status MoqtPublishNamespaceResponseStream::OnControlMessage(
     const MoqtRequestUpdate& message) {
+  QUICHE_RETURN_IF_ERROR(validate_request_id_(message.request_id));
+  if (!ParametersAllowedByRequestUpdate(message.parameters,
+                                        MoqtMessageType::kPublishNamespace)) {
+    return absl::InvalidArgumentError(
+        "REQUEST_UPDATE contains invalid parameters for PUBLISH_NAMESPACE");
+  }
   if (!prefix_.has_value()) {
     return absl::InvalidArgumentError(
         "REQUEST_UPDATE before PUBLISH_NAMESPACE on a PN stream");
   }
   application_(
       *prefix_, &message.parameters,
-      [weakptr = weak_ptr_factory_.Create(), id = message.request_id](
+      [weakptr = weak_ptr_factory_.Create()](
           std::variant<MessageParameters, MoqtRequestErrorInfo> response) {
         MoqtPublishNamespaceResponseStream* stream = weakptr.GetIfAvailable();
         if (stream == nullptr) {
           return;
         }
-        std::visit(
-            absl::Overload{[&](const MessageParameters& parameters) {
-                             stream->CheckStatus(
-                                 stream->SendRequestOk(id, parameters));
-                           },
-                           [&](const MoqtRequestErrorInfo& error) {
-                             stream->CheckStatus(stream->SendRequestError(
-                                 id, error.error_code, error.retry_interval,
-                                 error.reason_phrase));
-                           }},
-            response);
+        std::visit(absl::Overload{
+                       [&](const MessageParameters& parameters) {
+                         stream->CheckStatus(stream->SendRequestOk(
+                             parameters, MoqtMessageType::kRequestUpdate));
+                       },
+                       [&](const MoqtRequestErrorInfo& error) {
+                         stream->CheckStatus(stream->SendRequestError(error));
+                       }},
+                   response);
       });
   return absl::OkStatus();
 }

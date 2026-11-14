@@ -322,22 +322,30 @@ void SystraceParser::ParseSystracePoint(
         }
         // TODO(lalitm): we should not add LMK events to the counters table
         // once the UI has support for displaying instants.
-      } else if (point.name == "ScreenState") {
-        // Promote ScreenState to its own top level counter.
-        TrackId track = context_->track_tracker->InternTrack(
+      }
+
+      std::optional<TrackId> promoted;
+      if (point.name == "ScreenState") {
+        promoted = context_->track_tracker->InternTrack(
             tracks::kAndroidScreenStateBlueprint);
-        context_->event_tracker->PushCounter(
-            ts, static_cast<double>(point.int_value), track);
-        return;
-      } else if (point.name.StartsWith("battery_stats.")) {
+      } else if (point.name == "BatteryStatus") {
+        promoted = context_->track_tracker->InternTrack(
+            tracks::kAndroidBatteryStatusBlueprint);
+      } else if (point.name == "PlugType") {
+        promoted = context_->track_tracker->InternTrack(
+            tracks::kAndroidPlugTypeBlueprint);
+      } else if (base::StartsWith(point.name, "battery_stats.")) {
         // Promote battery_stats conters to global tracks.
         // Track name and definition should be kept in sync with
         // android_probes_parser.cc
-        TrackId track = context_->track_tracker->InternTrack(
+        promoted = context_->track_tracker->InternTrack(
             tracks::kAndroidBatteryStatsBlueprint,
             tracks::Dimensions(point.name));
+      }
+
+      if (promoted) {
         context_->event_tracker->PushCounter(
-            ts, static_cast<double>(point.int_value), track);
+            ts, static_cast<double>(point.int_value), *promoted);
         return;
       }
 
@@ -364,7 +372,7 @@ void SystraceParser::ParseSystracePoint(
 
 void SystraceParser::PostProcessSpecialSliceBegin(int64_t ts,
                                                   base::StringView name) {
-  if (name.StartsWith("lmk,")) {
+  if (base::StartsWith(name, "lmk,")) {
     // LMK events introduced with http://aosp/1782391 are treated specially
     // to parse the killed process oom_score_adj out of them.
     // Format is 'lmk,pid,reason,oom adj,...'

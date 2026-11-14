@@ -266,6 +266,17 @@ namespace perfetto::trace_processor::stats {
   F(traced_buf_chunks_written,            kIndexed, kInfo,     kTrace, Scope::kMachineAndTrace,    ""), \
   F(traced_buf_chunks_committed_out_of_order,                                  \
                                           kIndexed, kInfo,     kTrace, Scope::kMachineAndTrace,    ""), \
+  F(traced_buf_compactions,               kIndexed, kInfo,     kTrace, Scope::kMachineAndTrace,         \
+    "Number of completed TraceBufferV2 compactions, including those that "     \
+    "move no chunks and excluding calls that skip compaction, such as "        \
+    "calls on DISCARD or read-only buffers."),                                 \
+  F(traced_buf_compactions_skipped,       kIndexed, kInfo,     kTrace, Scope::kMachineAndTrace,         \
+    "Number of TraceBufferV2 compactions skipped because live chunks were "    \
+    "on both sides of the write cursor."),                                     \
+  F(traced_buf_oversized_packets_dropped, kIndexed, kDataLoss, kTrace, Scope::kMachineAndTrace,         \
+      "TraceBufferV2 only. Num. proto-group packets dropped at read time "     \
+      "because length-delimited protobuf cannot encode them: a nested "        \
+      "message larger than 256 MiB or a packet larger than 4 GiB."),           \
   F(traced_buf_padding_bytes_cleared,     kIndexed, kInfo,     kTrace, Scope::kMachineAndTrace,    ""), \
   F(traced_buf_padding_bytes_written,     kIndexed, kInfo,     kTrace, Scope::kMachineAndTrace,    ""), \
   F(traced_buf_patches_failed,            kIndexed, kDataLoss, kTrace, Scope::kMachineAndTrace,         \
@@ -910,6 +921,23 @@ namespace perfetto::trace_processor::stats {
       "A TrackEventRangeOfInterest packet was received without the required "  \
       "start_us field. The packet is ignored. This is a bug in the trace "     \
       "producer."),                                                            \
+  F(track_descriptor_invalid_dimension,         kSingle,  kError,  kAnalysis, Scope::kMachineAndTrace,  \
+      "A TrackDescriptor declared a dimension without a name or without a "    \
+      "value, which is ignored, or with an iid which is not in the interned "  \
+      "data of the sequence. A descriptor with an unknown name or value iid "  \
+      "is ignored entirely, so that a later re-emission with the interned "    \
+      "data can still be reserved; an unknown display_name_iid only drops "    \
+      "the display name."),                                                    \
+  F(track_descriptor_reserved_dimension_name,   kSingle,  kError,  kAnalysis, Scope::kMachineAndTrace,  \
+      "A TrackDescriptor declared a custom dimension using a name reserved "   \
+      "for well known dimensions (machine, gpu, cpu, process, thread). These " \
+      "are synthesized by trace processor and cannot be redefined: the "       \
+      "dimension is ignored. This is a bug in the trace producer."),           \
+  F(track_dimension_conflicting_value,          kSingle,  kError,  kAnalysis, Scope::kMachineAndTrace,  \
+      "A TrackDescriptor declared a dimension which it already inherits "      \
+      "from a parent_uuid ancestor, or declares twice, with a *different* "    \
+      "value. The inherited (or first declared) value is kept and the other "  \
+      "one is ignored. This is a bug in the trace producer."),                 \
   F(track_descriptor_invalid_child_ordering,    kSingle,  kError,  kAnalysis, Scope::kMachineAndTrace,  \
       "A TrackDescriptor specified an invalid or unrecognized value for "      \
       "child_tracks_ordering. The descriptor is ignored. This is a bug in "    \

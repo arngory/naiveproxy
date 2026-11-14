@@ -24,11 +24,13 @@
 #include "partition_alloc/partition_alloc_config.h"
 #include "partition_alloc/partition_alloc_constants.h"
 #include "partition_alloc/partition_alloc_forward.h"
+#include "partition_alloc/partition_alloc_public_constants.h"
 #include "partition_alloc/partition_freelist_entry.h"
 #include "partition_alloc/partition_lock.h"
 #include "partition_alloc/partition_stats.h"
 #include "partition_alloc/partition_tls.h"
 #include "partition_alloc/scheduler_loop_quarantine.h"
+#include "partition_alloc/slot_address_and_size.h"
 #include "partition_alloc/slot_start.h"
 #include "partition_alloc/thread_cache.h"
 
@@ -110,7 +112,7 @@ class PA_COMPONENT_EXPORT(PARTITION_ALLOC) ThreadCacheRegistry {
   // Controls the thread cache size, by setting the multiplier to a value above
   // or below |ThreadCache::kDefaultMultiplier|.
   void SetThreadCacheMultiplier(float multiplier);
-  void SetLargestActiveBucketIndex(uint16_t largest_active_bucket_index);
+  void SetActiveBucketCount(uint16_t active_bucket_count);
 
   static internal::Lock& GetLock() { return Instance().lock_; }
   // Purges all thread caches *now*. This is completely thread-unsafe, and
@@ -128,6 +130,8 @@ class PA_COMPONENT_EXPORT(PARTITION_ALLOC) ThreadCacheRegistry {
   static constexpr size_t kMinCachedMemoryForPurgingBytes = 500 * 1024;
 
  private:
+  friend class ThreadCache;
+  friend class PartitionAllocThreadCacheTest;
   friend class tools::ThreadCacheInspector;
   friend class tools::HeapDumper;
 
@@ -137,9 +141,9 @@ class PA_COMPONENT_EXPORT(PARTITION_ALLOC) ThreadCacheRegistry {
   bool periodic_purge_is_initialized_ = false;
   internal::base::TimeDelta periodic_purge_next_interval_;
 
-  uint16_t largest_active_bucket_index_ =
-      BucketIndexLookup::GetIndexForNeutralBuckets(
-          kThreadCacheDefaultSizeThreshold);
+  uint16_t active_bucket_count_ = BucketIndexLookup::GetIndexForNeutralBuckets(
+                                      kThreadCacheDefaultSizeThreshold) +
+                                  1;
 };
 
 constexpr ThreadCacheRegistry::ThreadCacheRegistry() = default;
@@ -283,20 +287,27 @@ class PA_COMPONENT_EXPORT(PARTITION_ALLOC) ThreadCache {
   // The slot comes from the bucket at index |bucket_index| from the partition
   // this cache is for.
   //
+  // When `allow_clear_bucket` is false, refuses insertion once the bucket
+  // reaches its post-clearing target (`(limit + 1) / 2`) so bulk callers that
+  // already batch-free to the root avoid repeatedly overflowing and walking the
+  // freelist via `ClearBucket()`.
+  // TODO(crbug.com/579744817): Remove `allow_clear_bucket` once dedicated
+  // batch-free support is implemented in `ThreadCache`.
+  //
   // Returns the slot size if the insertion succeeds, `nullopt` otherwise.
   // Insertion can fail either because the cache is full or the
   // allocation was too large.
+  template <bool allow_clear_bucket = true>
   PA_ALWAYS_INLINE std::optional<size_t> MaybePutInCache(
       UntaggedSlotStart slot_start,
       size_t bucket_index);
 
   // Tries to allocate a memory slot from the cache.
-  // Returns 0 on failure.
   //
   // Has the same behavior as RawAlloc(), that is: no cookie nor ref-count
-  // handling. Sets |slot_size| to the allocated size upon success.
-  PA_ALWAYS_INLINE UntaggedSlotStart GetFromCache(size_t bucket_index,
-                                                  size_t* slot_size);
+  // handling.
+  PA_ALWAYS_INLINE std::optional<SlotAddressAndSize> GetFromCache(
+      size_t bucket_index);
 
   // Asks this cache to trigger |Purge()| at a later point. Can be called from
   // any thread.
@@ -420,15 +431,14 @@ class PA_COMPONENT_EXPORT(PARTITION_ALLOC) ThreadCache {
   static constexpr uintptr_t kTombstoneMask = ~kTombstone;
 
   static std::array<uint8_t, kBucketCount> global_limits_;
-  // Index of the largest active bucket. Not all processes/platforms will use
-  // all buckets, as using larger buckets increases the memory footprint.
-  //
-  // TODO(lizeb): Investigate making this per-thread rather than static, to
-  // improve locality, and open the door to per-thread settings.
-  static uint16_t largest_active_bucket_index_;
 
+ private:
   // These are at the beginning as they're accessed for each allocation.
   uint32_t cached_memory_ = 0;
+  // Number of active buckets in this thread cache. Not all processes/platforms
+  // will use all buckets, as using larger buckets increases the memory
+  // footprint.
+  uint16_t active_bucket_count_ = 0;
   std::atomic<bool> should_purge_;
 #if PA_BUILDFLAG(HAS_64_BIT_POINTERS)
   const internal::PoolOffsetLookup offset_lookup_;
@@ -461,13 +471,14 @@ class PA_COMPONENT_EXPORT(PARTITION_ALLOC) ThreadCache {
   friend class tools::ThreadCacheInspector;
 };
 
+template <bool allow_clear_bucket>
 PA_ALWAYS_INLINE std::optional<size_t> ThreadCache::MaybePutInCache(
     UntaggedSlotStart slot_start,
     size_t bucket_index) {
   PA_REENTRANCY_GUARD(is_in_thread_cache_);
   PA_INCREMENT_COUNTER(stats_.cache_fill_count);
 
-  if (bucket_index > largest_active_bucket_index_) [[unlikely]] {
+  if (bucket_index >= active_bucket_count_) [[unlikely]] {
     PA_INCREMENT_COUNTER(stats_.cache_fill_misses);
     return std::nullopt;
   }
@@ -476,18 +487,32 @@ PA_ALWAYS_INLINE std::optional<size_t> ThreadCache::MaybePutInCache(
 
   PA_DCHECK(bucket.count != 0 || bucket.freelist_head == nullptr);
 
-  PutInBucket(bucket, slot_start);
-  cached_memory_ += bucket.slot_size;
-  PA_INCREMENT_COUNTER(stats_.cache_fill_hits);
-
   // Relaxed ordering: we don't care about having an up-to-date or consistent
   // value, just want it to not change while we are using it, hence using
   // relaxed ordering, and loading into a local variable. Without it, we are
   // gambling that the compiler would not issue multiple loads.
   uint8_t limit = bucket.limit.load(std::memory_order_relaxed);
-  // Batched deallocation, amortizing lock acquisitions.
-  if (bucket.count > limit) [[unlikely]] {
-    ClearBucket(bucket, limit / 2);
+  if constexpr (!allow_clear_bucket) {
+    if (bucket.count >= (limit + 1) / 2) {
+      PA_INCREMENT_COUNTER(stats_.cache_fill_misses);
+      if (should_purge_.load(std::memory_order_relaxed)) [[unlikely]] {
+        PurgeInternal();
+      }
+      return std::nullopt;
+    }
+  }
+
+  PutInBucket(bucket, slot_start);
+  cached_memory_ += bucket.slot_size;
+  PA_INCREMENT_COUNTER(stats_.cache_fill_hits);
+
+  if constexpr (allow_clear_bucket) {
+    // Batched deallocation, amortizing lock acquisitions.
+    if (bucket.count > limit) [[unlikely]] {
+      ClearBucket(bucket, limit / 2);
+    }
+  } else {
+    PA_DCHECK(bucket.count <= limit);
   }
 
   if (should_purge_.load(std::memory_order_relaxed)) [[unlikely]] {
@@ -497,8 +522,8 @@ PA_ALWAYS_INLINE std::optional<size_t> ThreadCache::MaybePutInCache(
   return bucket.slot_size;
 }
 
-PA_ALWAYS_INLINE UntaggedSlotStart
-ThreadCache::GetFromCache(size_t bucket_index, size_t* slot_size) {
+PA_ALWAYS_INLINE std::optional<SlotAddressAndSize> ThreadCache::GetFromCache(
+    size_t bucket_index) {
 #if PA_CONFIG(THREAD_CACHE_ALLOC_STATS)
   stats_.allocs_per_bucket_[bucket_index]++;
 #endif
@@ -506,10 +531,10 @@ ThreadCache::GetFromCache(size_t bucket_index, size_t* slot_size) {
   PA_REENTRANCY_GUARD(is_in_thread_cache_);
   PA_INCREMENT_COUNTER(stats_.alloc_count);
   // Only handle "small" allocations.
-  if (bucket_index > largest_active_bucket_index_) [[unlikely]] {
+  if (bucket_index >= active_bucket_count_) [[unlikely]] {
     PA_INCREMENT_COUNTER(stats_.alloc_miss_too_large);
     PA_INCREMENT_COUNTER(stats_.alloc_misses);
-    return UntaggedSlotStart();
+    return std::nullopt;
   }
 
   auto& bucket = buckets_[bucket_index];
@@ -525,7 +550,7 @@ ThreadCache::GetFromCache(size_t bucket_index, size_t* slot_size) {
     // Very unlikely, means that the central allocator is out of memory. Let it
     // deal with it (may return 0, may crash).
     if (!bucket.freelist_head) [[unlikely]] {
-      return UntaggedSlotStart();
+      return std::nullopt;
     }
   }
 
@@ -560,12 +585,14 @@ ThreadCache::GetFromCache(size_t bucket_index, size_t* slot_size) {
   bucket.count--;
   PA_DCHECK(bucket.count != 0 || !next);
   bucket.freelist_head = next;
-  *slot_size = bucket.slot_size;
 
   PA_DCHECK(cached_memory_ >= bucket.slot_size);
   cached_memory_ -= bucket.slot_size;
 
-  return SlotStart::Unchecked(entry).Untag();
+  return SlotAddressAndSize{
+      .slot_start = SlotStart::Unchecked(entry).Untag(),
+      .size = bucket.slot_size,
+  };
 }
 
 PA_ALWAYS_INLINE void ThreadCache::PutInBucket(Bucket& bucket,

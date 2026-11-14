@@ -8,6 +8,7 @@
 #include <string>
 
 #include "crypto/crypto_export.h"
+#include "crypto/sign.h"
 #include "crypto/unexportable_key.h"
 
 namespace crypto {
@@ -46,17 +47,17 @@ enum class TPMOperation {
   // An operation to verify the signature of a restricted signing key.
   kRestrictedMessageVerify,
 };
-// LINT.ThenChange(//tools/metrics/histograms/metadata/net/histograms.xml:TpmOperation)
+// LINT.ThenChange(//tools/metrics/histograms/metadata/crypto/histograms.xml:TpmOperation)
 
 // Converts the given `operation` to a string representation.
 CRYPTO_EXPORT std::string OperationToString(TPMOperation operation);
 
 // Converts the given `algorithm` to a string representation.
-CRYPTO_EXPORT std::string AlgorithmToString(
-    SignatureVerifier::SignatureAlgorithm algorithm);
+CRYPTO_EXPORT std::string AlgorithmToString(sign::SignatureKind algorithm);
 
 // Records UMA metrics of TPM availability, latency and successful usage.
-// Does the work on a new background task.
+// Runs slow, blocking TPM operations on the calling sequence, which must allow
+// blocking.
 CRYPTO_EXPORT void MaybeMeasureTpmOperations(
     UnexportableKeyProvider::Config config);
 
@@ -70,16 +71,6 @@ enum class TPMSupport {
   kRSA = 1,
   kECDSA = 2,
   kMaxValue = 2,
-};
-
-// Note that values here are used in a recorded histogram. Don't change
-// the values of existing members.
-enum class TPMType {
-  kNone = 0,
-  kHW = 1,
-  kVirtual = 2,
-  kBoth = 3,
-  kMaxValue = 3,
 };
 
 // Exported for testing

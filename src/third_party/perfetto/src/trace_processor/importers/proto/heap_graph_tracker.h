@@ -93,6 +93,16 @@ class HeapGraphTracker : public Destructible {
     return static_cast<HeapGraphTracker*>(context->heap_graph_tracker.get());
   }
 
+  // Shared by proto and HPROF importers. Named rows are also indexed for
+  // deobfuscation; proto rows can receive their names after insertion.
+  tables::HeapGraphClassTable::IdAndRow InsertClass(
+      const tables::HeapGraphClassTable::Row& row);
+  // Skip indexing for unnamed references and synthetic edges (array elements
+  // and runtime-internal references), which cannot match a field mapping.
+  tables::HeapGraphReferenceTable::IdAndRow InsertReference(
+      const tables::HeapGraphReferenceTable::Row& row,
+      bool index_field = true);
+
   void AddRoot(uint32_t seq_id, UniquePid upid, int64_t ts, SourceRoot root);
   void AddObject(uint32_t seq_id, UniquePid upid, int64_t ts, SourceObject obj);
   void AddInternedType(
@@ -119,13 +129,17 @@ class HeapGraphTracker : public Destructible {
 
   ~HeapGraphTracker() override;
 
-  const std::vector<tables::HeapGraphClassTable::RowNumber>* RowsForType(
-      std::optional<StringId> package_name,
-      StringId type_name) const {
-    auto it = class_to_rows_.find(std::make_pair(package_name, type_name));
-    if (it == class_to_rows_.end())
-      return nullptr;
-    return &it->second;
+  // Class rows for one type name in one package. A missing package means the
+  // class had no location information.
+  struct ClassRows {
+    std::optional<StringId> package;
+    std::vector<tables::HeapGraphClassTable::RowNumber> rows;
+  };
+
+  // Returns the rows for |type_name| grouped by package, or nullptr if no
+  // class has that name.
+  const std::vector<ClassRows>* RowsForType(StringId type_name) const {
+    return class_to_rows_.Find(type_name);
   }
 
   const std::vector<tables::HeapGraphReferenceTable::RowNumber>* RowsForField(
@@ -143,6 +157,13 @@ class HeapGraphTracker : public Destructible {
   }
 
  private:
+  // Index names when they become available without rewriting stored columns.
+  void IndexClassName(tables::HeapGraphClassTable::RowNumber row,
+                      StringId name,
+                      std::optional<StringId> package);
+  void IndexReferenceField(tables::HeapGraphReferenceTable::RowNumber row,
+                           StringId name);
+
   struct InternedField {
     StringId name;
     StringId type_name;
@@ -248,9 +269,7 @@ class HeapGraphTracker : public Destructible {
   tables::HeapGraphReferenceTable::Cursor referred_cursor_;
   tables::HeapGraphTable::Cursor heap_graph_cursor_;
 
-  std::map<std::pair<std::optional<StringId>, StringId>,
-           std::vector<tables::HeapGraphClassTable::RowNumber>>
-      class_to_rows_;
+  base::FlatHashMap<StringId, std::vector<ClassRows>> class_to_rows_;
   base::FlatHashMap<StringId,
                     std::vector<tables::HeapGraphReferenceTable::RowNumber>>
       field_to_rows_;

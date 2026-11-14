@@ -32,7 +32,7 @@ using MoqtObjectAckFunction =
 
 struct SubscribeOkData {
   MessageParameters parameters;
-  TrackExtensions extensions;
+  TrackProperties properties;
 };
 
 class SubscribeVisitor {
@@ -65,12 +65,32 @@ class SubscribeVisitor {
                              DataStreamIndex stream) = 0;
 };
 
+struct FetchOkData {
+  bool end_of_track = false;
+  Location end_location;
+  MessageParameters parameters;
+  TrackProperties properties;
+  bool operator==(const FetchOkData& other) const = default;
+};
+
+using FetchResponseCallback = quiche::SingleUseCallback<void(
+    std::variant<FetchOkData, MoqtRequestErrorInfo>)>;
+
+struct TrackStatusOkData {
+  MessageParameters parameters;
+  TrackProperties properties;
+  bool operator==(const TrackStatusOkData& other) const = default;
+};
+
+using TrackStatusResponseCallback = quiche::SingleUseCallback<void(
+    std::variant<TrackStatusOkData, MoqtRequestErrorInfo>)>;
+
 // Called when the SETUP message from the peer is received.
 using MoqtSessionEstablishedCallback = quiche::SingleUseCallback<void()>;
 
 // Called when a GOAWAY message is received from the server.
-using MoqtSessionGoAwayCallback =
-    quiche::SingleUseCallback<void(absl::string_view new_session_uri)>;
+using MoqtSessionGoAwayCallback = quiche::SingleUseCallback<void(
+    absl::string_view new_session_uri, quic::QuicTimeDelta timeout)>;
 
 // Called when the session is terminated.
 using MoqtSessionTerminatedCallback =
@@ -85,7 +105,7 @@ using MoqtSessionDeletedCallback = quiche::SingleUseCallback<void()>;
 // track until either MoqtResponseCallback returns with an error or the
 // application calls Unsubscribe.
 using MoqtIncomingPublishCallback = quiche::MultiUseCallback<SubscribeVisitor*(
-    const FullTrackName&, const MessageParameters&, const TrackExtensions&,
+    const FullTrackName&, const MessageParameters&, const TrackProperties&,
     MoqtResponseCallback)>;
 
 // Called whenever a PUBLISH_NAMESPACE or PUBLISH_NAMESPACE_DONE message is
@@ -142,7 +162,7 @@ inline void DefaultIncomingSubscribeTracksCallback(
 }
 
 inline SubscribeVisitor* DefaultIncomingPublishCallback(
-    const FullTrackName&, const MessageParameters&, const TrackExtensions&,
+    const FullTrackName&, const MessageParameters&, const TrackProperties&,
     MoqtResponseCallback) {
   return nullptr;
 }
@@ -151,7 +171,7 @@ inline SubscribeVisitor* DefaultIncomingPublishCallback(
 struct MoqtSessionCallbacks {
   MoqtSessionEstablishedCallback session_established_callback = +[] {};
   MoqtSessionGoAwayCallback goaway_received_callback =
-      +[](absl::string_view) {};
+      +[](absl::string_view, quic::QuicTimeDelta) {};
   MoqtSessionTerminatedCallback session_terminated_callback =
       +[](absl::string_view) {};
   MoqtSessionDeletedCallback session_deleted_callback = +[] {};

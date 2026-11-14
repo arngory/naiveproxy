@@ -369,7 +369,6 @@ class QUICHE_EXPORT QuicSession
 
   // SessionNotifierInterface methods:
   bool OnFrameAcked(const QuicFrame& frame, QuicTime::Delta ack_delay_time,
-                    QuicTime receive_timestamp,
                     bool is_retransmission) override;
   void OnStreamFrameRetransmitted(const QuicStreamFrame& frame) override;
   void OnFrameLost(const QuicFrame& frame) override;
@@ -430,8 +429,7 @@ class QUICHE_EXPORT QuicSession
   DatagramResult SendDatagram(quiche::QuicheMemSlice datagram);
 
   // Called when datagram with |datagram_id| gets acked.
-  virtual void OnDatagramAcked(QuicDatagramId datagram_id,
-                               QuicTime receive_timestamp);
+  virtual void OnDatagramAcked(QuicDatagramId datagram_id);
 
   // Called when datagram with |datagram_id| is considered as lost.
   virtual void OnDatagramLost(QuicDatagramId datagram_id);
@@ -871,6 +869,10 @@ class QUICHE_EXPORT QuicSession
     return notify_stream_soon_to_destroy_;
   }
 
+  bool bundle_retransmitted_crypto_frames() const {
+    return bundle_retransmitted_crypto_frames_;
+  }
+
  protected:
   using StreamMap =
       absl::flat_hash_map<QuicStreamId, std::unique_ptr<QuicStream>>;
@@ -1305,6 +1307,9 @@ class QUICHE_EXPORT QuicSession
   UberQuicStreamIdManager ietf_streamid_manager_;
 
   SavedConfig saved_config_;
+
+  bool bundle_retransmitted_crypto_frames_ =
+      GetQuicReloadableFlag(quic_bundle_crypto_retransmits);
 };
 
 }  // namespace quic

@@ -91,12 +91,13 @@ base::DictValue NetLogResults(const HostResolverDnsTask::Results& results) {
 }
 
 void RecordResolveTimeDiff(const char* histogram_variant,
-                           base::TimeTicks start_time,
                            base::TimeTicks first_record_end_time,
                            base::TimeTicks second_record_end_time) {
-  CHECK_LE(start_time, first_record_end_time);
-  CHECK_LE(first_record_end_time, second_record_end_time);
-  base::TimeDelta diff = second_record_end_time - first_record_end_time;
+  // TimeTicks::Now() (e.g., CLOCK_MONOTONIC on Linux) can slightly go backwards
+  // across CPU cores due to TSC skew. Clamp negative diffs to zero instead of
+  // CHECK-crashing.
+  base::TimeDelta diff = std::max(
+      base::TimeDelta(), second_record_end_time - first_record_end_time);
 
   base::UmaHistogramTimes(
       base::StrCat({"Net.Dns.ResolveTimeDiff2.", histogram_variant}), diff);
@@ -114,10 +115,8 @@ void RecordResolveTimeDiff(const char* histogram_variant,
 // TODO(crbug.com/40269419): Delete once results are always sorted as individual
 // transactions complete.
 std::vector<IPEndPoint> ExtractAddressResultsForSort(
-    HostResolverDnsTask::Results& results,
-    bool is_happy_eyeballs_v3_enabled) {
-  CHECK(!base::FeatureList::IsEnabled(features::kUseHostResolverCache) &&
-        !is_happy_eyeballs_v3_enabled);
+    HostResolverDnsTask::Results& results) {
+  CHECK(!base::FeatureList::IsEnabled(features::kUseHostResolverCache));
 
   // To simplify processing, assume no more than one result per address query
   // type.
@@ -649,15 +648,15 @@ void HostResolverDnsTask::OnDnsTransactionComplete(
     case DnsQueryType::A:
       a_record_end_time_ = now;
       if (!aaaa_record_end_time_.is_null()) {
-        RecordResolveTimeDiff("AAAABeforeA", task_start_time_,
-                              aaaa_record_end_time_, a_record_end_time_);
+        RecordResolveTimeDiff("AAAABeforeA", aaaa_record_end_time_,
+                              a_record_end_time_);
       }
       if (!https_record_end_time_.is_null()) {
         if (aaaa_record_end_time_.is_null()) {
-          RecordResolveTimeDiff("HTTPSBeforeFirstAddress", task_start_time_,
+          RecordResolveTimeDiff("HTTPSBeforeFirstAddress",
                                 https_record_end_time_, a_record_end_time_);
         } else {
-          RecordResolveTimeDiff("HTTPSBeforeLastAddress", task_start_time_,
+          RecordResolveTimeDiff("HTTPSBeforeLastAddress",
                                 https_record_end_time_, a_record_end_time_);
         }
       }
@@ -665,15 +664,15 @@ void HostResolverDnsTask::OnDnsTransactionComplete(
     case DnsQueryType::AAAA:
       aaaa_record_end_time_ = now;
       if (!a_record_end_time_.is_null()) {
-        RecordResolveTimeDiff("ABeforeAAAA", task_start_time_,
-                              a_record_end_time_, aaaa_record_end_time_);
+        RecordResolveTimeDiff("ABeforeAAAA", a_record_end_time_,
+                              aaaa_record_end_time_);
       }
       if (!https_record_end_time_.is_null()) {
         if (a_record_end_time_.is_null()) {
-          RecordResolveTimeDiff("HTTPSBeforeFirstAddress", task_start_time_,
+          RecordResolveTimeDiff("HTTPSBeforeFirstAddress",
                                 https_record_end_time_, aaaa_record_end_time_);
         } else {
-          RecordResolveTimeDiff("HTTPSBeforeLastAddress", task_start_time_,
+          RecordResolveTimeDiff("HTTPSBeforeLastAddress",
                                 https_record_end_time_, aaaa_record_end_time_);
         }
       }
@@ -685,7 +684,7 @@ void HostResolverDnsTask::OnDnsTransactionComplete(
               ? std::min(a_record_end_time_, aaaa_record_end_time_)
               : std::max(a_record_end_time_, aaaa_record_end_time_);
       if (!first_address_end_time.is_null()) {
-        RecordResolveTimeDiff("AddressRecordBeforeHTTPS", task_start_time_,
+        RecordResolveTimeDiff("AddressRecordBeforeHTTPS",
                               first_address_end_time, now);
       }
       break;
@@ -694,8 +693,9 @@ void HostResolverDnsTask::OnDnsTransactionComplete(
       break;
   }
 
-  if (base::FeatureList::IsEnabled(features::kUseHostResolverCache) ||
-      delegate_->IsHappyEyeballsV3Enabled()) {
+  if (transaction_info->type == DnsQueryType::AAAA &&
+      (base::FeatureList::IsEnabled(features::kUseHostResolverCache) ||
+       delegate_->ShouldSortTransactionsIndividually())) {
     SortTransactionAndHandleResults(std::move(transaction_info),
                                     std::move(results).value());
   } else {
@@ -759,6 +759,8 @@ bool HostResolverDnsTask::IsFatalTransactionFailure(
 void HostResolverDnsTask::SortTransactionAndHandleResults(
     std::unique_ptr<TransactionInfo> transaction_info,
     Results transaction_results) {
+  CHECK_EQ(transaction_info->type, DnsQueryType::AAAA);
+
   // Expect at most 1 data result in an individual transaction.
   CHECK_LE(std::ranges::count_if(
                transaction_results,
@@ -784,6 +786,10 @@ void HostResolverDnsTask::SortTransactionAndHandleResults(
   }
 
   if (!endpoints_to_sort.empty()) {
+    DCHECK(std::ranges::all_of(endpoints_to_sort, [](const IPEndPoint& e) {
+      return e.address().IsIPv6();
+    }));
+
     // More async work to do, so insert `transaction_info` back onto
     // `transactions_in_progress_`.
     base::WeakPtr<TransactionInfo> transaction_info_ptr =
@@ -945,12 +951,12 @@ void HostResolverDnsTask::OnTransactionsFinished(
 
   timeout_timer_.Stop();
 
-  // If using HostResolverCache or Happy Eyeballs v3, transactions are already
-  // invidvidually sorted on completion.
+  // If using HostResolverCache or individual transaction sort, transactions are
+  // already individually sorted on completion.
   if (!base::FeatureList::IsEnabled(features::kUseHostResolverCache) &&
-      !delegate_->IsHappyEyeballsV3Enabled()) {
-    std::vector<IPEndPoint> endpoints_to_sort = ExtractAddressResultsForSort(
-        saved_results_, delegate_->IsHappyEyeballsV3Enabled());
+      !delegate_->ShouldSortTransactionsIndividually()) {
+    std::vector<IPEndPoint> endpoints_to_sort =
+        ExtractAddressResultsForSort(saved_results_);
 
     // Need to sort if results contain at least one IPv6 address.
     if (!endpoints_to_sort.empty()) {
@@ -974,7 +980,7 @@ void HostResolverDnsTask::OnSortComplete(base::TimeTicks sort_start_time,
                                          bool success,
                                          std::vector<IPEndPoint> sorted) {
   CHECK(!base::FeatureList::IsEnabled(features::kUseHostResolverCache));
-  CHECK(!delegate_->IsHappyEyeballsV3Enabled());
+  CHECK(!delegate_->ShouldSortTransactionsIndividually());
 
   if (!success) {
     OnFailure(ERR_DNS_SORT_ERROR, /*allow_fallback=*/true, &results);

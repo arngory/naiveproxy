@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "perfetto/base/logging.h"
+#include "perfetto/ext/base/string_utils.h"
 #include "perfetto/ext/base/string_view.h"
 #include "perfetto/ext/base/utils.h"
 #include "perfetto/protozero/field.h"
@@ -95,7 +96,7 @@ InternedSmapsPath InternSmapsPath(TraceProcessorContext* context,
   InternedSmapsPath ret;
   ret.path_id = context->storage->InternString(path);
   base::StringView trimmed = path;
-  if (path.EndsWith(kDeletedSuffix)) {
+  if (base::EndsWith(path, kDeletedSuffix)) {
     trimmed = path.substr(0, path.size() - kDeletedSuffix.size());
     ret.is_deleted = true;
   }
@@ -651,8 +652,14 @@ void ProfileModule::ParseSmapsPacket(int64_t ts, ConstBytes blob) {
 
   for (auto it = sp.entries(); it; ++it) {
     protos::pbzero::SmapsEntry::Decoder e(*it);
-    InternedSmapsPath interned =
-        InternSmapsPath(context_, base::StringView(e.path()));
+    // Chrome's memory-infra only writes the mapping name to |file_name|.
+    InternedSmapsPath interned = InternSmapsPath(
+        context_, base::StringView(e.has_path() ? e.path() : e.file_name()));
+    // Per-entry smaps don't carry Rss, but it is the sum of the resident
+    // shared and private pages, as in /proc/pid/smaps.
+    auto rss_kb = static_cast<int64_t>(
+        e.private_clean_resident_kb() + e.private_dirty_kb() +
+        e.shared_clean_resident_kb() + e.shared_dirty_resident_kb());
     context_->storage->mutable_profiler_smaps_table()->Insert(
         {upid,
          ts,
@@ -674,7 +681,7 @@ void ProfileModule::ParseSmapsPacket(int64_t ts, ConstBytes blob) {
          static_cast<int64_t>(e.shared_clean_resident_kb()),
          static_cast<int64_t>(e.locked_kb()),
          static_cast<int64_t>(e.proportional_resident_kb()),
-         /*rss_kb=*/int64_t{0},
+         rss_kb,
          /*anonymous_kb=*/int64_t{0},
          /*pss_dirty_kb=*/int64_t{0},
          /*swap_pss_kb=*/int64_t{0}});
@@ -840,7 +847,7 @@ void ProfileModule::OnEventsFullyExtracted() {
     NullTermStringView path = context_->storage->GetString(it.name());
     NullTermStringView build_id = context_->storage->GetString(it.build_id());
 
-    if (path.StartsWith("/data/local/tmp/") && build_id.empty()) {
+    if (base::StartsWith(path, "/data/local/tmp/") && build_id.empty()) {
       context_->stats_tracker->IncrementStats(
           stats::symbolization_tmp_build_id_not_found);
     }

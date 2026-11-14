@@ -12,6 +12,7 @@
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "quiche/quic/core/quic_time.h"
+#include "quiche/quic/moqt/moqt_names.h"
 #include "quiche/common/platform/api/quiche_export.h"
 #include "quiche/web_transport/web_transport.h"
 
@@ -26,7 +27,6 @@ enum QUICHE_EXPORT MoqtError : uint64_t {
   kInvalidRequestId = 0x4,
   kDuplicateTrackAlias = 0x5,
   kKeyValueFormattingError = 0x6,
-  kTooManyRequests = 0x7,
   kInvalidPath = 0x8,
   kMalformedPath = 0x9,
   kGoawayTimeout = 0x10,
@@ -52,11 +52,14 @@ inline constexpr webtransport::StreamErrorCode kResetCodeInternalError = 0x00;
 inline constexpr webtransport::StreamErrorCode kResetCodeCancelled = 0x01;
 inline constexpr webtransport::StreamErrorCode kResetCodeDeliveryTimeout = 0x02;
 inline constexpr webtransport::StreamErrorCode kResetCodeSessionClosed = 0x03;
-inline constexpr webtransport::StreamErrorCode kResetCodeUnknownObjectStatus =
-    0x04;
-inline constexpr webtransport::StreamErrorCode kResetCodeMalformedTrack = 0x12;
-// Proposed in a PR post draft-16.
+inline constexpr webtransport::StreamErrorCode kResetCodeGoingAway = 0x04;
 inline constexpr webtransport::StreamErrorCode kResetCodeTooFarBehind = 0x05;
+inline constexpr webtransport::StreamErrorCode kResetCodeUnknownObjectStatus =
+    0x06;
+inline constexpr webtransport::StreamErrorCode kResetCodeExpiredAuthToken =
+    0x07;
+inline constexpr webtransport::StreamErrorCode kResetCodeExcessiveLoad = 0x09;
+inline constexpr webtransport::StreamErrorCode kResetCodeMalformedTrack = 0x12;
 
 // Used for SUBSCRIBE_ERROR, PUBLISH_NAMESPACE_ERROR, PUBLISH_NAMESPACE_CANCEL,
 // SUBSCRIBE_NAMESPACE_ERROR, and FETCH_ERROR.
@@ -68,14 +71,17 @@ enum class QUICHE_EXPORT RequestErrorCode : uint64_t {
   kMalformedAuthToken = 0x4,
   kExpiredAuthToken = 0x5,
   kGoingAway = 0x6,
+  kExcessiveLoad = 0x9,
   kDoesNotExist = 0x10,
   kInvalidRange = 0x11,
   kMalformedTrack = 0x12,
   kDuplicateSubscription = 0x19,
   kUninterested = 0x20,
-  kNamespacePrefixUnknown = 0x21,
   kPrefixOverlap = 0x30,
+  kNamespaceTooLarge = 0x31,
   kInvalidJoiningRequestId = 0x32,
+  kUnsupportedExtension = 0x33,
+  kRedirect = 0x34,
 };
 
 enum class QUICHE_EXPORT PublishDoneCode : uint64_t {
@@ -84,16 +90,24 @@ enum class QUICHE_EXPORT PublishDoneCode : uint64_t {
   kTrackEnded = 0x2,
   kSubscriptionEnded = 0x3,
   kGoingAway = 0x4,
-  kExpired = 0x5,
-  kTooFarBehind = 0x6,
+  kTooFarBehind = 0x5,
+  kExpired = 0x6,
   kUpdateFailed = 0x8,
+  kExcessiveLoad = 0x9,
   kMalformedTrack = 0x12,
+};
+
+struct Redirect {
+  std::string connect_uri;
+  FullTrackName full_track_name;
+  bool operator==(const Redirect& other) const = default;
 };
 
 struct MoqtRequestErrorInfo {
   RequestErrorCode error_code;
   std::optional<quic::QuicTimeDelta> retry_interval;
   std::string reason_phrase;
+  std::optional<Redirect> redirect = std::nullopt;
   bool operator==(const MoqtRequestErrorInfo& other) const = default;
 };
 
@@ -101,9 +115,11 @@ RequestErrorCode StatusToRequestErrorCode(absl::Status status);
 absl::StatusCode RequestErrorCodeToStatusCode(RequestErrorCode error_code);
 absl::Status RequestErrorCodeToStatus(RequestErrorCode error_code,
                                       absl::string_view reason_phrase);
+MoqtRequestErrorInfo StatusToMoqtRequestError(absl::Status status);
 
 absl::Status MoqtStreamErrorToStatus(webtransport::StreamErrorCode error_code,
                                      absl::string_view reason_phrase);
+webtransport::StreamErrorCode StatusToMoqtStreamError(absl::Status status);
 
 }  // namespace moqt
 

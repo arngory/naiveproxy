@@ -925,6 +925,10 @@ void HostResolverManager::Job::OnDnsTaskComplete(
     DnsTransactionFactory::AttemptMode attempt_mode) {
   DCHECK(dns_task_);
 
+  if (dns_task_results_manager_) {
+    dns_task_results_manager_->ProcessDnsTaskComplete(results);
+  }
+
   HostCache::Entry legacy_results(results, base::Time::Now(),
                                   tick_clock_->NowTicks(),
                                   HostCache::Entry::SOURCE_DNS);
@@ -1016,8 +1020,23 @@ void HostResolverManager::Job::OnIntermediateTransactionsComplete(
   }
 }
 
-bool HostResolverManager::Job::IsHappyEyeballsV3Enabled() const {
-  return resolver_->IsHappyEyeballsV3Enabled();
+bool HostResolverManager::Job::ShouldSortTransactionsIndividually() const {
+  if (!dns_task_results_manager_) {
+    return false;
+  }
+  if (resolver_->IsHappyEyeballsV3Enabled()) {
+    return true;
+  }
+  if (base::FeatureList::IsEnabled(features::kEnableIntermediateDnsResults) &&
+      !features::kEnableIntermediateDnsResultsSortTransactionsIndividually
+           .Get()) {
+    return false;
+  }
+  if (base::FeatureList::IsEnabled(features::kAsyncDnsQuicJob) &&
+      !features::kAsyncDnsQuicJobSortTransactionsIndividually.Get()) {
+    return false;
+  }
+  return true;
 }
 
 void HostResolverManager::Job::AddTransactionTimeQueued(

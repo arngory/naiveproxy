@@ -4,6 +4,7 @@
 """Entry point for "from-source" and "from-jar" commands."""
 
 import collections
+import json
 import logging
 import os
 import pathlib
@@ -20,9 +21,12 @@ from codegen import natives_header
 from codegen import placeholder_gen_jni_java
 from codegen import placeholder_java_type
 from codegen import proxy_impl_java
+from codegen import proxy_impl_kotlin
 import common
+import java_parse
 import java_types
-import parse
+import kotlin_parse
+import parse_common
 import proxy
 
 
@@ -55,7 +59,7 @@ class NativeMethod:
     if self.is_proxy:
       class_without_prefix = java_class.class_without_prefix
       # Signature with all reference types changed to "Object".
-      self.proxy_signature = self.signature.to_proxy()
+      self.proxy_signature = self.signature.to_proxy(unwrap_safe_pointers=True)
       if self.needs_implicit_array_element_class_param:
         self.proxy_signature = proxy.add_implicit_array_element_class_param(
             self.proxy_signature)
@@ -83,15 +87,33 @@ class NativeMethod:
     # Set when the first param dictates this is implemented as a member
     # function of the native class given as the first parameter.
     first_param = self.params and self.params[0]
-    if (first_param and first_param.java_type.is_primitive()
-        and first_param.java_type.primitive_name == 'long'
-        and first_param.name.startswith('native')):
-      if parsed_method.native_class_name:
-        self.first_param_cpp_type = parsed_method.native_class_name
-      else:
-        self.first_param_cpp_type = first_param.name[len('native'):]
+    is_long_member = (first_param and first_param.java_type.is_primitive()
+                      and first_param.java_type.primitive_name == 'long'
+                      and first_param.name.startswith('native'))
+    is_safe_ptr_member = (first_param
+                          and first_param.java_type.is_safe_pointer()
+                          and first_param.name == 'self')
+    if is_long_member or is_safe_ptr_member:
+      self._member_first_param = first_param
     else:
-      self.first_param_cpp_type = None
+      self._member_first_param = None
+
+  @property
+  def first_param_cpp_type(self):
+    # Resolved lazily: the link step builds NativeMethod without a type
+    # catalog, so a safe pointer token has no C++ type there.
+    first_param = self._member_first_param
+    if not first_param:
+      return None
+    if first_param.java_type.is_safe_pointer():
+      backend_type = first_param.java_type.to_backend_cpp_type()
+      assert backend_type.endswith('*'), (
+          'Only JniPtr<T> may be used as the "self" first parameter; '
+          f'got {first_param.java_type.java_class.name}.')
+      return backend_type[:-1]
+    if self.native_class_name:
+      return self.native_class_name
+    return first_param.name[len('native'):]
 
   @property
   def params(self):
@@ -155,6 +177,7 @@ class NativeMethod:
 
 class CalledByNative:
   """Describes a Java method that is called from C++"""
+
   def __init__(self,
                class_type_resolver,
                parsed_called_by_native,
@@ -476,9 +499,6 @@ def _generate_headers(jni_mode,
   if extra_includes:
     user_includes += extra_includes
   system_includes = ['jni.h']
-  if any(f.const_value in ('Infinity', '-Infinity', 'NaN')
-         for f in jni_obj.IterFields()):
-    system_includes.append('limits')
 
   preamble, epilogue = header_common.header_preamble(
       GetScriptName(),
@@ -495,6 +515,11 @@ def _generate_headers(jni_mode,
   sb(epilogue)
   shared_header_content = sb.to_string()
 
+  if any(f.const_value in ('Infinity', '-Infinity', 'NaN')
+         for f in jni_obj.IterFields()):
+    system_includes.append('limits')
+  # For std::move().
+  system_includes.append('utility')
   user_includes.append(os.path.basename(shared_header_file))
   preamble, epilogue = header_common.header_preamble(
       GetScriptName(),
@@ -588,12 +613,13 @@ def _RemoveStaleHeaders(path, shared_header_names, unshared_header_names):
           os.remove(file_path)
 
 
-def _CheckNotEmpty(jni_objs):
+def _CheckNotEmpty(parsed_files):
   has_empty = False
-  for jni_obj in jni_objs:
-    if not jni_obj.natives and not jni_obj.jni_classes:
+  for pf in parsed_files:
+    if not (pf.proxy_methods or pf.classes_with_jni
+            or pf.outer_class.non_proxy_methods or pf.type_tokens):
       has_empty = True
-      sys.stderr.write(f'No native methods found in {jni_obj.filename}.\n')
+      sys.stderr.write(f'No native methods found in {pf.filename}.\n')
   if has_empty:
     sys.exit(1)
 
@@ -615,7 +641,7 @@ def _ParseClassFiles(jar_file, class_files, args):
   for class_file in class_files:
     path_arg = f'jar:file://{jar_file}!/{class_file}'
     contents = _RunJavap(args.javap, path_arg)
-    parsed_file = parse.parse_javap_data(class_file, contents)
+    parsed_file = java_parse.parse_javap_data(class_file, contents)
     ret.append(
         JniObject(parsed_file,
                   from_javap=True,
@@ -624,12 +650,16 @@ def _ParseClassFiles(jar_file, class_files, args):
   return ret
 
 
+def _IsKotlin(jni_obj):
+  return jni_obj.filename.endswith('.kt')
+
+
 def _CreateSrcJar(srcjar_path, jni_mode, gen_jni_class, jni_objs, *,
                   script_name):
   with common.atomic_output(srcjar_path) as f:
     with zipfile.ZipFile(f, 'w') as srcjar:
       for jni_obj in jni_objs:
-        if not jni_obj.proxy_natives:
+        if not jni_obj.proxy_natives or _IsKotlin(jni_obj):
           continue
         content = proxy_impl_java.Generate(jni_mode,
                                            jni_obj,
@@ -644,6 +674,32 @@ def _CreateSrcJar(srcjar_path, jni_mode, gen_jni_class, jni_objs, *,
                                                     script_name=script_name)
         zip_path = f'{gen_jni_class.full_name_with_slashes}.java'
         common.add_to_zip_hermetic(srcjar, zip_path, data=content)
+
+
+def _WriteKotlinProxies(output_dir, jni_mode, gen_jni_class, jni_objs, *,
+                        script_name):
+  """Writes FooJni.kt next to the headers for each Kotlin input.
+
+  Unlike FooJni.java, these cannot go in the .srcjar since build systems detect
+  Kotlin via loose .kt sources. A file is always written (a comment-only stub
+  when the class has no @NativeMethods) so that the build's declared outputs
+  exist.
+  """
+  for jni_obj in jni_objs:
+    if not _IsKotlin(jni_obj):
+      continue
+    basename = os.path.splitext(os.path.basename(jni_obj.filename))[0]
+    if jni_obj.proxy_natives:
+      content = proxy_impl_kotlin.Generate(jni_mode,
+                                           jni_obj,
+                                           gen_jni_class=gen_jni_class,
+                                           script_name=script_name)
+    else:
+      package = jni_obj.java_class.class_without_prefix.package_with_dots
+      content = f'// {basename}.kt has no @NativeMethods.\npackage {package}\n'
+    with common.atomic_output(os.path.join(output_dir, f'{basename}Jni.kt'),
+                              'w') as f:
+      f.write(content)
 
 
 def _CreatePlaceholderSrcJar(srcjar_path, jni_objs, *, script_name):
@@ -677,7 +733,10 @@ def _CreatePlaceholderSrcJar(srcjar_path, jni_objs, *, script_name):
       # write a stubbed version of the class if it's imported by another class.
       for jni_obj in jni_objs:
         for java_class in jni_obj.CollectClassesToBeImported():
-          if java_class.full_name_with_slashes.startswith('java/'):
+          # JniPtr is already in gendeps_java; JniUniquePtr and JniRawPtr are in
+          # jni_zero_java and still need placeholders.
+          if (java_class.full_name_with_slashes.startswith('java/')
+              or java_class == java_types.JNI_PTR_CLASS):
             continue
           # TODO(mheikal): handle more than 1 nesting layer.
           if java_class.is_nested():
@@ -740,6 +799,9 @@ def _WriteResolvedTypes(resolved_types_path, jni_objs):
 
 
 def GenerateFromSource(parser, args, jni_mode):
+  if args.depfile and not (args.srcjar_path or args.output_type_catalog):
+    parser.error('--depfile requires --srcjar-path or --output-type-catalog')
+
   # Remove existing headers so that moving .java source files but not updating
   # the corresponding C++ include will be a compile failure (otherwise
   # incremental builds will usually not catch this).
@@ -749,22 +811,47 @@ def GenerateFromSource(parser, args, jni_mode):
   try:
     errors = []
     parsed_files = []
+    type_catalog, loaded_type_catalogs = common.load_type_catalogs(
+        type_catalogs_file=args.type_catalogs_file,
+        type_catalogs=args.type_catalogs)
+
     for f in args.input_files:
+      parse_func = (kotlin_parse.parse_kotlin_file
+                    if f.endswith('.kt') else java_parse.parse_java_file)
       try:
         parsed_files.append(
-            parse.parse_java_file(
+            parse_common.parse_file(
                 f,
+                parse_func,
                 package_prefix=args.package_prefix,
                 package_prefix_filter=args.package_prefix_filter,
                 allow_private_called_by_natives=args.
-                allow_private_called_by_natives))
-      except parse.ParseError as e:
+                allow_private_called_by_natives,
+                type_catalog=type_catalog,
+                enable_safe_pointers=args.enable_safe_pointers))
+      except parse_common.ParseError as e:
         errors.append(e)
 
     if errors:
       for e in errors:
         sys.stderr.write(f'\n--- JNI Parsing Error ---\n{e}\n')
       sys.exit(1)
+
+    _CheckNotEmpty(parsed_files)
+
+    for pf in parsed_files:
+      common.merge_type_catalogs(type_catalog, pf.type_tokens, pf.filename)
+
+    if args.enable_safe_pointers:
+      java_parse.resolve_safe_pointers(parsed_files, type_catalog)
+
+    if args.output_type_catalog:
+      local_type_catalog = {}
+      for parsed_file in parsed_files:
+        common.merge_type_catalogs(local_type_catalog, parsed_file.type_tokens,
+                                   parsed_file.filename)
+      with common.atomic_output(args.output_type_catalog, 'w') as f:
+        json.dump(local_type_catalog, f, indent=2, sort_keys=True)
 
     jni_objs = [
         JniObject(x,
@@ -774,10 +861,12 @@ def GenerateFromSource(parser, args, jni_mode):
                   use_weak_called_by_natives=args.weak_called_by_natives)
         for x in parsed_files
     ]
-    _CheckNotEmpty(jni_objs)
+    if args.depfile:
+      first_out = args.srcjar_path or args.output_type_catalog
+      common.write_depfile(args.depfile, first_out, loaded_type_catalogs)
     if args.resolved_types_path:
       _WriteResolvedTypes(args.resolved_types_path, jni_objs)
-  except parse.ParseError as e:
+  except parse_common.ParseError as e:
     sys.stderr.write(f'{e}\n')
     sys.exit(1)
 
@@ -813,6 +902,13 @@ def GenerateFromSource(parser, args, jni_mode):
     else:
       # Only @CalledByNatives.
       zipfile.ZipFile(args.srcjar_path, 'w').close()
+    # gen_jni_class is only used when there are proxy natives, in which case it
+    # was set to the non-short class above.
+    _WriteKotlinProxies(args.output_dir,
+                        jni_mode,
+                        gen_jni_class,
+                        jni_objs,
+                        script_name=GetScriptName())
   if args.jni_pickle:
     with common.atomic_output(args.jni_pickle, 'wb') as f:
       pickle.dump(
@@ -843,7 +939,7 @@ def GenerateFromJar(parser, args, jni_mode):
 
   try:
     jni_objs = _ParseClassFiles(args.jar_file, args.input_files, args)
-  except parse.ParseError as e:
+  except parse_common.ParseError as e:
     sys.stderr.write(f'{e}\n')
     sys.exit(1)
 

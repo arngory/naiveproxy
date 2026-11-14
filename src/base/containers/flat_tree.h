@@ -50,6 +50,11 @@ struct ConditionalImpl<false> {
 template <bool B, class T, class F>
 using ConditionalT = ConditionalImpl<B>::template type<T, F>;
 
+// This file intentionally uses the iterator-based algorithms instead of the
+// `std::ranges::` ones: checking the constraints of a `std::ranges::` algorithm
+// costs several milliseconds of compile time for every new combination of
+// container and comparator, and flat_tree is used with a lot of them.
+
 // Helper functions used in DCHECKs below to make sure that inputs tagged with
 // sorted_unique are indeed sorted and unique.
 template <typename Range, typename Comp>
@@ -57,8 +62,8 @@ constexpr bool is_sorted_and_unique(const Range& range, Comp comp) {
   // Being unique implies that there are no adjacent elements that
   // compare equal. So this checks that each element is strictly less
   // than the element after it.
-  return std::ranges::adjacent_find(range, std::not_fn(comp)) ==
-         std::ranges::end(range);
+  return std::adjacent_find(std::ranges::begin(range), std::ranges::end(range),
+                            std::not_fn(comp)) == std::ranges::end(range);
 }
 
 // Helper inspired by C++20's std::to_array to convert a C-style array to a
@@ -277,17 +282,17 @@ class flat_tree {
   // NOTE: Prefer to build a new flat_tree from a std::vector (or similar)
   // instead of calling insert() repeatedly.
 
-  std::pair<iterator, bool> insert(const value_type& val);
-  std::pair<iterator, bool> insert(value_type&& val);
+  constexpr std::pair<iterator, bool> insert(const value_type& val);
+  constexpr std::pair<iterator, bool> insert(value_type&& val);
 
-  iterator insert(const_iterator position_hint, const value_type& x);
-  iterator insert(const_iterator position_hint, value_type&& x);
+  constexpr iterator insert(const_iterator position_hint, const value_type& x);
+  constexpr iterator insert(const_iterator position_hint, value_type&& x);
 
   // This method inserts the values from the range [first, last) into the
   // current tree.
   template <class InputIterator>
     requires(std::input_iterator<InputIterator>)
-  void insert(InputIterator first, InputIterator last);
+  constexpr void insert(InputIterator first, InputIterator last);
 
   // Inserts the all values from the `range` into the current tree.
   template <class Range>
@@ -295,7 +300,7 @@ class flat_tree {
   void insert_range(Range&& range);
 
   template <class... Args>
-  std::pair<iterator, bool> emplace(Args&&... args);
+  constexpr std::pair<iterator, bool> emplace(Args&&... args);
 
   template <class... Args>
   iterator emplace_hint(const_iterator position_hint, Args&&... args);
@@ -424,7 +429,8 @@ class flat_tree {
   // iterator to the element with key |key| and a bool indicating whether an
   // insertion happened.
   template <class K, class... Args>
-  std::pair<iterator, bool> emplace_key_args(const K& key, Args&&... args);
+  constexpr std::pair<iterator, bool> emplace_key_args(const K& key,
+                                                       Args&&... args);
 
   // Similar to |emplace_key_args|, but checks |hint| first as a possible
   // insertion position.
@@ -792,19 +798,19 @@ constexpr auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::crend()
 // https://github.com/electronicarts/EASTL/blob/master/include/EASTL/vector_set.h#L493
 
 template <class Key, class GetKeyFromValue, class KeyCompare, class Container>
-auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert(
+constexpr auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert(
     const value_type& val) -> std::pair<iterator, bool> {
   return emplace_key_args(GetKeyFromValue()(val), val);
 }
 
 template <class Key, class GetKeyFromValue, class KeyCompare, class Container>
-auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert(
+constexpr auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert(
     value_type&& val) -> std::pair<iterator, bool> {
   return emplace_key_args(GetKeyFromValue()(val), std::move(val));
 }
 
 template <class Key, class GetKeyFromValue, class KeyCompare, class Container>
-auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert(
+constexpr auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert(
     const_iterator position_hint,
     const value_type& val) -> iterator {
   return emplace_hint_key_args(position_hint, GetKeyFromValue()(val), val)
@@ -812,7 +818,7 @@ auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert(
 }
 
 template <class Key, class GetKeyFromValue, class KeyCompare, class Container>
-auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert(
+constexpr auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert(
     const_iterator position_hint,
     value_type&& val) -> iterator {
   return emplace_hint_key_args(position_hint, GetKeyFromValue()(val),
@@ -823,7 +829,7 @@ auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert(
 template <class Key, class GetKeyFromValue, class KeyCompare, class Container>
 template <class InputIterator>
   requires(std::input_iterator<InputIterator>)
-void flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert(
+constexpr void flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert(
     InputIterator input_begin,
     InputIterator input_end) {
   if (input_begin == input_end) {
@@ -874,7 +880,7 @@ void flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::insert_range(
 
 template <class Key, class GetKeyFromValue, class KeyCompare, class Container>
 template <class... Args>
-auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::emplace(
+constexpr auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::emplace(
     Args&&... args) -> std::pair<iterator, bool> {
   return insert(value_type(std::forward<Args>(args)...));
 }
@@ -1025,7 +1031,7 @@ template <typename K>
 constexpr auto
 flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::lower_bound(
     const KeyT<K>& key) const -> const_iterator {
-  return std::ranges::lower_bound(*this, key, KeyValueCompare(comp_));
+  return std::lower_bound(begin(), end(), key, KeyValueCompare(comp_));
 }
 
 template <class Key, class GetKeyFromValue, class KeyCompare, class Container>
@@ -1041,7 +1047,7 @@ template <typename K>
 constexpr auto
 flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::upper_bound(
     const KeyT<K>& key) const -> const_iterator {
-  return std::ranges::upper_bound(*this, key, KeyValueCompare(comp_));
+  return std::upper_bound(begin(), end(), key, KeyValueCompare(comp_));
 }
 
 // ----------------------------------------------------------------------------
@@ -1064,7 +1070,8 @@ flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::unsafe_emplace(
 
 template <class Key, class GetKeyFromValue, class KeyCompare, class Container>
 template <class K, class... Args>
-auto flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::emplace_key_args(
+constexpr auto
+flat_tree<Key, GetKeyFromValue, KeyCompare, Container>::emplace_key_args(
     const K& key,
     Args&&... args) -> std::pair<iterator, bool> {
   auto lower = lower_bound(key);
@@ -1109,9 +1116,9 @@ size_t EraseIf(
     base::internal::flat_tree<Key, GetKeyFromValue, KeyCompare, Container>&
         container,
     Predicate pred) {
-  auto removed = std::ranges::remove_if(container, pred);
-  size_t num_removed = removed.size();
-  container.erase(removed.begin(), removed.end());
+  auto removed = std::remove_if(container.begin(), container.end(), pred);
+  size_t num_removed = static_cast<size_t>(container.end() - removed);
+  container.erase(removed, container.end());
   return num_removed;
 }
 

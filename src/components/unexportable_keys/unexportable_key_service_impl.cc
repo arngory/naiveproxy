@@ -37,8 +37,10 @@
 #include "components/unexportable_keys/service_error.h"
 #include "components/unexportable_keys/unexportable_key_id.h"
 #include "components/unexportable_keys/unexportable_key_task_manager.h"
+#include "crypto/sign.h"
 #include "crypto/unexportable_key.h"
 #include "third_party/abseil-cpp/absl/container/flat_hash_map.h"
+#include "third_party/abseil-cpp/absl/container/flat_hash_set.h"
 
 namespace unexportable_keys {
 
@@ -55,8 +57,8 @@ concept SparePoolKeyIdType = std::same_as<T, UnexportableSigningKeyId> ||
 
 // The default list of signature algorithms to use for generating spare keys.
 constexpr std::array kSpareKeyAlgorithms = {
-    crypto::SignatureVerifier::SignatureAlgorithm::ECDSA_SHA256,
-    crypto::SignatureVerifier::SignatureAlgorithm::RSA_PKCS1_SHA256,
+    crypto::sign::ECDSA_SHA256,
+    crypto::sign::RSA_PKCS1_SHA256,
 };
 
 // Delays the initial replenishment of the spare key pool during service
@@ -74,27 +76,28 @@ template <typename KeyType>
   requires SparePoolKeyType<KeyType>
 base::RepeatingCallback<
     void(crypto::UnexportableKeyProvider::Config,
-         base::span<const crypto::SignatureVerifier::SignatureAlgorithm>,
+         base::span<const crypto::sign::SignatureKind>,
          base::OnceCallback<void(ServiceErrorOr<scoped_refptr<KeyType>>)>)>
 CreateGenerateKeyCallbackForSparePool(UnexportableKeyTaskManager* task_manager,
                                       BackgroundTaskOrigin origin) {
   return base::BindRepeating(
       [](UnexportableKeyTaskManager* task_manager, BackgroundTaskOrigin origin,
          crypto::UnexportableKeyProvider::Config config,
-         base::span<const crypto::SignatureVerifier::SignatureAlgorithm>
-             algorithms,
+         base::span<const crypto::sign::SignatureKind> algorithms,
          base::OnceCallback<void(ServiceErrorOr<scoped_refptr<KeyType>>)>
              callback) {
         if constexpr (std::same_as<KeyType, RefCountedUnexportableSigningKey>) {
           task_manager->GenerateSigningKeySlowlyAsync(
               origin, std::move(config), algorithms,
-              BackgroundTaskPriority::kBestEffort, std::move(callback));
+              BackgroundTaskPriority::kMinPriorityInternalUseOnly,
+              std::move(callback));
         } else if constexpr (std::same_as<
                                  KeyType,
                                  RefCountedUnexportableAttestationKey>) {
           task_manager->GenerateAttestationKeySlowlyAsync(
               origin, std::move(config), algorithms,
-              BackgroundTaskPriority::kBestEffort, std::move(callback));
+              BackgroundTaskPriority::kMinPriorityInternalUseOnly,
+              std::move(callback));
         }
       },
       base::Unretained(task_manager), origin);
@@ -177,7 +180,7 @@ std::string GetSpareKeyPoolHistogramName(std::string_view suffix) {
        suffix},
       ".");
 }
-// LINT.ThenChange(//tools/metrics/histograms/metadata/net/histograms.xml:UnexportableKeysSpareKeyPoolType)
+// LINT.ThenChange(//tools/metrics/histograms/metadata/crypto/histograms.xml:UnexportableKeysSpareKeyPoolType)
 
 // Wraps the original key generation callback with latency metrics tracking.
 // This records the duration from when the request was initiated until it is
@@ -291,11 +294,10 @@ class SpareKeyPoolRequest {
  public:
   void Start(
       crypto::UnexportableKeyProvider::Config config,
-      base::span<const crypto::SignatureVerifier::SignatureAlgorithm>
-          acceptable_algorithms,
+      base::span<const crypto::sign::SignatureKind> acceptable_algorithms,
       base::RepeatingCallback<void(
           crypto::UnexportableKeyProvider::Config,
-          base::span<const crypto::SignatureVerifier::SignatureAlgorithm>,
+          base::span<const crypto::sign::SignatureKind>,
           base::OnceCallback<void(ServiceErrorOr<scoped_refptr<KeyType>>)>)>
           generate_key_fn,
       base::OnceCallback<
@@ -494,7 +496,7 @@ class UnexportableKeyServiceImpl::SpareKeyPool {
       crypto::UnexportableKeyProvider::Config config,
       base::RepeatingCallback<void(
           crypto::UnexportableKeyProvider::Config,
-          base::span<const crypto::SignatureVerifier::SignatureAlgorithm>,
+          base::span<const crypto::sign::SignatureKind>,
           base::OnceCallback<void(ServiceErrorOr<scoped_refptr<KeyType>>)>)>
           spare_key_generation_callback)
       : config_(std::move(config)),
@@ -517,8 +519,7 @@ class UnexportableKeyServiceImpl::SpareKeyPool {
   // miss reason (uninitialized, failed creation, wrong algorithm, or pending
   // replenishment) to UMA.
   scoped_refptr<KeyType> PopSpareKey(
-      base::span<const crypto::SignatureVerifier::SignatureAlgorithm>
-          acceptable_algorithms) {
+      base::span<const crypto::sign::SignatureKind> acceptable_algorithms) {
     std::unique_ptr<crypto::UnexportableKeyProvider> provider =
         UnexportableKeyTaskManager::GetUnexportableKeyProvider(config_);
     if (!provider) {
@@ -549,7 +550,7 @@ class UnexportableKeyServiceImpl::SpareKeyPool {
     // acceptable but less preferred by the provider. If it fails, it means the
     // hardware does not support any of the requested algorithms (e.g., no TPM
     // support at all).
-    ASSIGN_OR_RETURN(crypto::SignatureVerifier::SignatureAlgorithm algorithm,
+    ASSIGN_OR_RETURN(crypto::sign::SignatureKind algorithm,
                      provider->SelectAlgorithm(acceptable_algorithms),
                      [this]() {
                        RecordRetrievalResult(
@@ -576,8 +577,7 @@ class UnexportableKeyServiceImpl::SpareKeyPool {
   // avoid over-allocation. Calculates the target number of tasks upfront to
   // prevent an infinite loop if the key provider fails synchronously.
   void ReplenishSpareKeyPoolAsync(
-      base::span<const crypto::SignatureVerifier::SignatureAlgorithm>
-          acceptable_algorithms) {
+      base::span<const crypto::sign::SignatureKind> acceptable_algorithms) {
     if (!inflight_spare_key_pool_requests_.has_value()) {
       inflight_spare_key_pool_requests_.emplace();
     }
@@ -652,11 +652,11 @@ class UnexportableKeyServiceImpl::SpareKeyPool {
 
   const base::RepeatingCallback<void(
       crypto::UnexportableKeyProvider::Config,
-      base::span<const crypto::SignatureVerifier::SignatureAlgorithm>,
+      base::span<const crypto::sign::SignatureKind>,
       base::OnceCallback<void(ServiceErrorOr<scoped_refptr<KeyType>>)>)>
       spare_key_generation_callback_;
 
-  absl::flat_hash_map<crypto::SignatureVerifier::SignatureAlgorithm,
+  absl::flat_hash_map<crypto::sign::SignatureKind,
                       std::vector<scoped_refptr<KeyType>>>
       spare_keys_pool_;
 
@@ -670,7 +670,8 @@ class UnexportableKeyServiceImpl::SpareKeyPool {
 UnexportableKeyServiceImpl::UnexportableKeyServiceImpl(
     UnexportableKeyTaskManager& task_manager,
     BackgroundTaskOrigin task_origin,
-    crypto::UnexportableKeyProvider::Config config)
+    crypto::UnexportableKeyProvider::Config config,
+    bool enable_spare_attestation_key_pool)
     : task_manager_(task_manager),
       task_origin_(task_origin),
       config_(config),
@@ -683,10 +684,12 @@ UnexportableKeyServiceImpl::UnexportableKeyServiceImpl(
         CreateGenerateKeyCallbackForSparePool<RefCountedUnexportableSigningKey>(
             &task_manager, task_origin));
 
-    spare_attestation_key_pool_ = std::make_unique<SpareAttestationKeyPool>(
-        config_,
-        CreateGenerateKeyCallbackForSparePool<
-            RefCountedUnexportableAttestationKey>(&task_manager, task_origin));
+    if (enable_spare_attestation_key_pool) {
+      spare_attestation_key_pool_ = std::make_unique<SpareAttestationKeyPool>(
+          config_, CreateGenerateKeyCallbackForSparePool<
+                       RefCountedUnexportableAttestationKey>(&task_manager,
+                                                             task_origin));
+    }
   }
 }
 
@@ -709,8 +712,7 @@ bool UnexportableKeyServiceImpl::IsStatefulUnexportableKeyProviderSupported(
 }
 
 void UnexportableKeyServiceImpl::GenerateSigningKeySlowlyAsync(
-    base::span<const crypto::SignatureVerifier::SignatureAlgorithm>
-        acceptable_algorithms,
+    base::span<const crypto::sign::SignatureKind> acceptable_algorithms,
     BackgroundTaskPriority priority,
     base::OnceCallback<void(ServiceErrorOr<UnexportableSigningKeyId>)>
         callback) {
@@ -761,8 +763,7 @@ void UnexportableKeyServiceImpl::FromWrappedSigningKeySlowlyAsync(
 }
 
 void UnexportableKeyServiceImpl::GenerateAttestationKeySlowlyAsync(
-    base::span<const crypto::SignatureVerifier::SignatureAlgorithm>
-        acceptable_algorithms,
+    base::span<const crypto::sign::SignatureKind> acceptable_algorithms,
     BackgroundTaskPriority priority,
     base::OnceCallback<void(ServiceErrorOr<UnexportableAttestationKeyId>)>
         callback) {
@@ -931,7 +932,7 @@ ServiceErrorOr<std::vector<uint8_t>> UnexportableKeyServiceImpl::GetWrappedKey(
   return key->GetWrappedKey();
 }
 
-ServiceErrorOr<crypto::SignatureVerifier::SignatureAlgorithm>
+ServiceErrorOr<crypto::sign::SignatureKind>
 UnexportableKeyServiceImpl::GetAlgorithm(
     UnexportableSigningKeyId key_id) const {
   ASSIGN_OR_RETURN(const crypto::UnexportableSigningKey* key,

@@ -420,6 +420,8 @@ class QUICHE_EXPORT QuicSentPacketManager {
     return send_algorithm_.get();
   }
 
+  SendAlgorithmInterface* GetSendAlgorithm() { return send_algorithm_.get(); }
+
   void ReduceMemoryUsage() {
     unacked_packets_.ReduceMemoryUsage();
     send_algorithm_->ReduceMemoryUsage();
@@ -567,7 +569,6 @@ class QUICHE_EXPORT QuicSentPacketManager {
   void MarkPacketHandled(QuicPacketNumber packet_number,
                          QuicTime ack_receive_time,
                          QuicTime::Delta ack_delay_time,
-                         QuicTime receive_timestamp,
                          QuicTransmissionInfo*& info);
 
   // Request that |packet_number| be retransmitted after the other pending

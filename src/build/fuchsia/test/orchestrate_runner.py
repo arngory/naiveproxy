@@ -14,7 +14,7 @@ import sys
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-import common  # pylint: disable=wrong-import-position
+import common  # noqa: E402
 
 
 def support_orchestrate(test_type: str) -> bool:
@@ -98,7 +98,10 @@ def run_tests_with_orchestrate(
     if not logs_dir:
         logs_dir = '/tmp/'
 
-    config_json = os.path.join(SCRIPT_DIR, 'orchestrate.json')
+    config_json = os.path.join(
+        SCRIPT_DIR, f'orchestrate_{common.get_host_arch()}.json'
+    )
+    assert os.path.exists(config_json)
     overrides = {
         'emulator': {
             'package_archives': packages,

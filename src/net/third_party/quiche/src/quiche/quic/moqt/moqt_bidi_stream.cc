@@ -59,41 +59,57 @@ void MoqtBidiStreamBase::OnCanWrite() {
 }
 
 absl::Status MoqtBidiStreamBase::SendRequestOk(
-    uint64_t request_id, const MessageParameters& parameters, bool fin) {
-  return SendOrBufferMessage(
-      framer_->SerializeRequestOk(MoqtRequestOk{request_id, parameters}), fin);
+    const MessageParameters& parameters, MoqtMessageType type_of_ok) {
+  MoqtRequestOk request_ok(parameters);
+  SanitizeRequestOkParameters(request_ok.parameters, type_of_ok);
+  return SendOrBufferMessage(framer_->SerializeRequestOk(request_ok), false);
 }
 
 absl::Status MoqtBidiStreamBase::SendRequestError(
-    uint64_t request_id, RequestErrorCode error_code,
+    RequestErrorCode error_code,
     std::optional<quic::QuicTimeDelta> retry_interval,
-    absl::string_view reason_phrase, bool fin) {
-  MoqtRequestError request_error;
-  request_error.request_id = request_id;
-  request_error.error_code = error_code;
-  request_error.retry_interval = retry_interval;
-  request_error.reason_phrase = reason_phrase;
-  return SendOrBufferMessage(framer_->SerializeRequestError(request_error),
-                             fin);
+    absl::string_view reason_phrase) {
+  MoqtRequestErrorInfo error_info(error_code, retry_interval,
+                                  std::string(reason_phrase));
+  return SendRequestError(error_info);
 }
 
-absl::Status MoqtBidiStreamBase::SendRequestError(uint64_t request_id,
-                                                  MoqtRequestErrorInfo info,
-                                                  bool fin) {
-  return SendRequestError(request_id, info.error_code, info.retry_interval,
-                          info.reason_phrase, fin);
+absl::Status MoqtBidiStreamBase::SendRequestError(
+    const MoqtRequestErrorInfo& info) {
+  return SendOrBufferMessage(framer_->SerializeRequestError(info),
+                             /*fin=*/true);
 }
 
 absl::Status MoqtBidiStreamBase::SendRequestUpdate(
-    uint64_t request_id, uint64_t existing_request_id,
-    const MessageParameters& parameters, MoqtResponseCallback callback) {
+    uint64_t request_id, const MessageParameters& parameters,
+    MoqtResponseCallback callback, MoqtMessageType updated_type) {
   MoqtRequestUpdate request_update;
   request_update.request_id = request_id;
-  request_update.existing_request_id = existing_request_id;
   request_update.parameters = parameters;
-  request_update_queue_.Enqueue(parameters, std::move(callback));
+  SanitizeUpdateParameters(request_update.parameters, updated_type);
+  outgoing_update_queue_.Enqueue(request_update.parameters,
+                                 std::move(callback));
   return SendOrBufferMessage(framer_->SerializeRequestUpdate(request_update),
                              /*fin=*/false);
+}
+
+// TODO(martinduke): There should be an application callback when these are
+// received, but https://github.com/moq-wg/moq-transport/issues/1655 is
+// resolving which child classes of MoqtBidiStreamBase should handle them. For
+// now, we just handle them silently, as in draft-18 they are all allowed, to
+// avoid changing the application API twice. However, it will return an error if
+// the message is incorrectly formatted or there is more than one.
+absl::Status MoqtBidiStreamBase::OnControlMessage(const MoqtGoAway& message) {
+  if (received_goaway_) {
+    return absl::InvalidArgumentError(
+        "Received multiple GOAWAY on a bidi stream");
+  }
+  if (message.request_id.has_value()) {
+    return absl::InvalidArgumentError(
+        "GOAWAY with request ID on a bidi stream");
+  }
+  received_goaway_ = true;
+  return absl::OkStatus();
 }
 
 void MoqtBidiStreamBase::OnFatalError(absl::Status status) {

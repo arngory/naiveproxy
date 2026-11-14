@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -112,74 +113,7 @@ std::optional<uint64_t> ReadMoqVarIntFromStream(webtransport::Stream& stream,
   return result;
 }
 
-// Reads from |reader| to list. Returns false if there is a read error.
-absl::Status ParseKeyValuePairList(quic::QuicDataReader& reader,
-                                   KeyValuePairList& list) {
-  list.clear();
-  uint64_t num_params;
-  if (!reader.ReadMoqVarInt(&num_params)) {
-    return absl::InvalidArgumentError(
-        "Unable to parse key-value pair list element count");
-  }
-  uint64_t type = 0;
-  for (uint64_t i = 0; i < num_params; ++i) {
-    uint64_t type_diff;
-    if (!reader.ReadMoqVarInt(&type_diff)) {
-      return absl::InvalidArgumentError(
-          "Unable to parse the key in a key-value pair");
-    }
-    QUICHE_RETURN_IF_ERROR(SafeIncrementByWithStatus(type, type_diff));
-    if (type % 2 == 1) {
-      absl::string_view bytes;
-      if (!reader.ReadStringPieceMoqVarInt(&bytes)) {
-        return absl::InvalidArgumentError(
-            "Unable to read the string value in a key-value pair");
-      }
-      list.insert(type, bytes);
-      continue;
-    }
-    uint64_t value;
-    if (!reader.ReadMoqVarInt(&value)) {
-      return absl::InvalidArgumentError(
-          "Unable to read the integer value in a key-value pair");
-    }
-    list.insert(type, value);
-  }
-  return absl::OkStatus();
-}
-
-absl::Status ParseKeyValuePairListWithNoPrefix(quic::QuicDataReader& reader,
-                                               KeyValuePairList& list) {
-  list.clear();
-  uint64_t type = 0;
-  while (reader.BytesRemaining() > 0) {
-    uint64_t type_diff;
-    if (!reader.ReadMoqVarInt(&type_diff)) {
-      return absl::InvalidArgumentError(
-          "Unable to parse the key in a key-value pair");
-    }
-    QUICHE_RETURN_IF_ERROR(SafeIncrementByWithStatus(type, type_diff));
-    if (type % 2 == 1) {
-      absl::string_view bytes;
-      if (!reader.ReadStringPieceMoqVarInt(&bytes)) {
-        return absl::InvalidArgumentError(
-            "Unable to read the string value in a key-value pair");
-      }
-      list.insert(type, bytes);
-      continue;
-    }
-    uint64_t value;
-    if (!reader.ReadMoqVarInt(&value)) {
-      return absl::InvalidArgumentError(
-          "Unable to read the integer value in a key-value pair");
-    }
-    list.insert(type, value);
-  }
-  return absl::OkStatus();
-}
-
-bool ParseAuthTokenParameter(absl::string_view field,
-                             std::vector<AuthToken>& out) {
+bool ParseAuthToken(absl::string_view field, std::vector<AuthToken>& out) {
   quic::QuicDataReader reader(field);
   AuthTokenAliasType alias_type;
   uint64_t alias;
@@ -226,12 +160,6 @@ bool ParseAuthTokenParameter(absl::string_view field,
   return true;
 }
 
-bool ParseLocation(absl::string_view field, Location& out) {
-  quic::QuicDataReader reader(field);
-  return reader.ReadMoqVarInt(&out.group) &&
-         reader.ReadMoqVarInt(&out.object) && reader.IsDoneReading();
-}
-
 absl::Status ParseSubscriptionFilter(absl::string_view field,
                                      std::optional<SubscriptionFilter>& out) {
   quic::QuicDataReader reader(field);
@@ -265,33 +193,287 @@ absl::Status ParseSubscriptionFilter(absl::string_view field,
   return absl::OkStatus();
 }
 
+absl::Status ReadTrackNamespace(quic::QuicDataReader& reader,
+                                TrackNamespace& track_namespace) {
+  QUICHE_DCHECK(track_namespace.empty());
+  uint64_t num_elements;
+  if (!reader.ReadMoqVarInt(&num_elements)) {
+    return absl::InvalidArgumentError(
+        "Unable to parse the number of namespace elements");
+  }
+  if (num_elements > kMaxNamespaceElements) {
+    return absl::InvalidArgumentError("Invalid number of namespace elements");
+  }
+  if (num_elements == 0) {
+    return absl::OkStatus();
+  }
+  absl::FixedArray<absl::string_view> elements(num_elements);
+  for (uint64_t i = 0; i < num_elements; ++i) {
+    if (!reader.ReadStringPieceMoqVarInt(&elements[i])) {
+      return absl::InvalidArgumentError(
+          "Namespace element shorter than specified");
+    }
+  }
+  if (!track_namespace.Append(elements)) {
+    return absl::InvalidArgumentError("Track namespace is too large");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ReadFullTrackName(quic::QuicDataReader& reader,
+                               FullTrackName& full_track_name) {
+  QUICHE_DCHECK(!full_track_name.IsValid());
+  TrackNamespace track_namespace;
+  QUICHE_RETURN_IF_ERROR(ReadTrackNamespace(reader, track_namespace));
+  absl::string_view name;
+  if (!reader.ReadStringPieceMoqVarInt(&name)) {
+    return absl::InvalidArgumentError("Unable to parse track name");
+  }
+  absl::StatusOr<FullTrackName> full_track_name_or =
+      FullTrackName::Create(std::move(track_namespace), std::string(name));
+  QUICHE_RETURN_IF_ERROR(full_track_name_or.status());
+  full_track_name = *std::move(full_track_name_or);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<MessageParameters> ParseMessageParameters(
+    quic::QuicDataReader& reader) {
+  MessageParameters params;
+  uint64_t num_params;
+  if (!reader.ReadMoqVarInt(&num_params)) {
+    return absl::InvalidArgumentError(
+        "Unable to parse key-value pair list element count");
+  }
+  uint64_t type = 0;
+  uint8_t value8;
+  uint64_t value64;
+  absl::string_view value_str;
+  for (uint64_t i = 0; i < num_params; ++i) {
+    uint64_t type_diff;
+    if (!reader.ReadMoqVarInt(&type_diff)) {
+      return absl::InvalidArgumentError("Unable to parse the parameter type");
+    }
+    QUICHE_RETURN_IF_ERROR(SafeIncrementByWithStatus(type, type_diff));
+    switch (static_cast<MessageParameter>(type)) {
+      case MessageParameter::kObjectDeliveryTimeout:
+        if (params.object_delivery_timeout.has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        if (!reader.ReadMoqVarInt(&value64)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        if (value64 == 0) {
+          params.object_delivery_timeout = quic::QuicTimeDelta::Infinite();
+          break;
+        }
+        params.object_delivery_timeout =
+            quic::QuicTimeDelta::TryFromMilliseconds(value64).value_or(
+                quic::QuicTimeDelta::Infinite());
+        break;
+      case MessageParameter::kAuthorizationToken:
+        if (!reader.ReadStringPieceMoqVarInt(&value_str)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        if (!ParseAuthToken(value_str, params.authorization_tokens)) {
+          return absl::InvalidArgumentError("Malformed auth token parameter");
+        }
+        break;
+      case MessageParameter::kRendezvousTimeout:
+        if (params.rendezvous_timeout.has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        if (!reader.ReadMoqVarInt(&value64)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        params.rendezvous_timeout =
+            std::min(kMaxRendezvousTimeout,
+                     quic::QuicTimeDelta::TryFromMilliseconds(value64).value_or(
+                         quic::QuicTimeDelta::Infinite()));
+        break;
+      case MessageParameter::kSubgroupDeliveryTimeout:
+        if (params.subgroup_delivery_timeout.has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        if (!reader.ReadMoqVarInt(&value64)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        if (value64 == 0) {
+          params.subgroup_delivery_timeout = quic::QuicTimeDelta::Infinite();
+          break;
+        }
+        params.subgroup_delivery_timeout =
+            quic::QuicTimeDelta::TryFromMilliseconds(value64).value_or(
+                quic::QuicTimeDelta::Infinite());
+        break;
+      case MessageParameter::kExpires:
+        if (params.expires.has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        if (!reader.ReadMoqVarInt(&value64)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        params.expires =
+            quic::QuicTimeDelta::TryFromMilliseconds(value64).value_or(
+                quic::QuicTimeDelta::Infinite());
+        if (params.expires->IsZero()) {
+          params.expires = quic::QuicTimeDelta::Infinite();
+        }
+        break;
+      case MessageParameter::kLargestObject: {
+        uint64_t group, object;
+        if (params.largest_object.has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        if (!reader.ReadMoqVarInt(&group) || !reader.ReadMoqVarInt(&object)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        params.largest_object = Location(group, object);
+        break;
+      }
+      case MessageParameter::kFillTimeout:
+        if (params.fill_timeout.has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        if (!reader.ReadMoqVarInt(&value64)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        params.fill_timeout =
+            quic::QuicTimeDelta::TryFromMilliseconds(value64).value_or(
+                quic::QuicTimeDelta::Infinite());
+        break;
+      case MessageParameter::kForward:
+        if (params.forward_has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        if (!reader.ReadUInt8(&value8)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        if (value8 > 1) {
+          return absl::InvalidArgumentError("FORWARD must be 0 or 1");
+        }
+        params.set_forward(value8 != 0);
+        break;
+      case MessageParameter::kSubscriberPriority:
+        if (params.subscriber_priority.has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        if (!reader.ReadUInt8(&value8)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        params.subscriber_priority = static_cast<MoqtPriority>(value8);
+        break;
+      case MessageParameter::kSubscriptionFilter:
+        if (params.subscription_filter.has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        if (!reader.ReadStringPieceMoqVarInt(&value_str)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        QUICHE_RETURN_IF_ERROR(
+            ParseSubscriptionFilter(value_str, params.subscription_filter));
+        break;
+      case MessageParameter::kGroupOrder:
+        if (params.group_order.has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        if (!reader.ReadUInt8(&value8)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        if (value8 > kMaxMoqtGroupOrder || value8 < kMinMoqtGroupOrder) {
+          return absl::InvalidArgumentError(
+              "GROUP_ORDER is outside the valid range");
+        }
+        params.group_order = static_cast<MoqtGroupOrder>(value8);
+        break;
+      case MessageParameter::kNewGroupRequest:
+        if (params.new_group_request.has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        if (!reader.ReadMoqVarInt(&value64)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        params.new_group_request = value64;
+        break;
+      case MessageParameter::kTrackNamespacePrefix:
+        if (params.track_namespace_prefix.has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        params.track_namespace_prefix.emplace();
+        QUICHE_RETURN_IF_ERROR(
+            ReadTrackNamespace(reader, *params.track_namespace_prefix));
+        break;
+      case MessageParameter::kOackWindowSize:
+        if (params.oack_window_size.has_value()) {
+          return absl::InvalidArgumentError("Duplicate Message Parameter");
+        }
+        if (!reader.ReadMoqVarInt(&value64)) {
+          return absl::InvalidArgumentError("Parameter parsing error");
+        }
+        // Since QuicTimeDelta stores an int64_t value in microseconds, it is
+        // possible for the value to be out of range.
+        params.oack_window_size =
+            value64 > std::numeric_limits<int64_t>::max()
+                ? quic::QuicTimeDelta::Infinite()
+                : quic::QuicTimeDelta::FromMicroseconds(value64);
+        break;
+      default:
+        // Unknown MessageParameters not allowed!
+        return absl::InvalidArgumentError(
+            absl::StrCat("Unknown message parameter 0x", absl::Hex(type)));
+    }
+  }
+  return params;
+}
+
+absl::Status ParseKeyValuePairList(quic::QuicDataReader& reader,
+                                   KeyValuePairList& list) {
+  list.clear();
+  uint64_t type = 0;
+  while (reader.BytesRemaining() > 0) {
+    uint64_t type_diff;
+    if (!reader.ReadMoqVarInt(&type_diff)) {
+      return absl::InvalidArgumentError(
+          "Unable to parse the key in a key-value pair");
+    }
+    QUICHE_RETURN_IF_ERROR(SafeIncrementByWithStatus(type, type_diff));
+    if (type % 2 == 1) {
+      absl::string_view bytes;
+      if (!reader.ReadStringPieceMoqVarInt(&bytes)) {
+        return absl::InvalidArgumentError(
+            "Unable to read the string value in a key-value pair");
+      }
+      list.insert(type, bytes);
+      continue;
+    }
+    uint64_t value;
+    if (!reader.ReadMoqVarInt(&value)) {
+      return absl::InvalidArgumentError(
+          "Unable to read the integer value in a key-value pair");
+    }
+    list.insert(type, value);
+  }
+  return absl::OkStatus();
+}
+
 }  // namespace
 
-absl::Status SetupParameters::FromKeyValuePairList(
-    const KeyValuePairList& list) {
+absl::Status SetupOptions::FromKeyValuePairList(const KeyValuePairList& list) {
   absl::Status status = absl::OkStatus();
   uint64_t last_key;
   bool result = list.ForEach(
       [&](uint64_t key, std::variant<uint64_t, absl::string_view> value) {
         last_key = key;
-        switch (static_cast<SetupParameter>(key)) {
-          case SetupParameter::kMaxRequestId:
-            if (max_request_id.has_value()) {
-              status = absl::InvalidArgumentError("Duplicate Setup Parameter");
-              return false;
-            }
-            max_request_id = std::get<uint64_t>(value);
-            break;
-          case SetupParameter::kMaxAuthTokenCacheSize:
+        switch (static_cast<SetupOption>(key)) {
+          case SetupOption::kMaxAuthTokenCacheSize:
             if (max_auth_token_cache_size.has_value()) {
-              status = absl::InvalidArgumentError("Duplicate Setup Parameter");
+              status = absl::InvalidArgumentError("Duplicate Setup Option");
               return false;
             }
             max_auth_token_cache_size = std::get<uint64_t>(value);
             break;
-          case SetupParameter::kPath:
+          case SetupOption::kPath:
             if (path.has_value()) {
-              status = absl::InvalidArgumentError("Duplicate Setup Parameter");
+              status = absl::InvalidArgumentError("Duplicate Setup Option");
               return false;
             }
             if (!http2::adapter::HeaderValidator::IsValidPath(
@@ -303,14 +485,14 @@ absl::Status SetupParameters::FromKeyValuePairList(
             }
             path = std::get<absl::string_view>(value);
             break;
-          case SetupParameter::kAuthorizationToken:
-            if (!ParseAuthTokenParameter(std::get<absl::string_view>(value),
-                                         authorization_tokens)) {
-              status = KeyValueFormatError("Malformed auth token parameter");
+          case SetupOption::kAuthorizationToken:
+            if (!ParseAuthToken(std::get<absl::string_view>(value),
+                                authorization_tokens)) {
+              status = KeyValueFormatError("Malformed auth token option");
               return false;
             }
             break;
-          case SetupParameter::kAuthority:
+          case SetupOption::kAuthority:
             if (!http2::adapter::HeaderValidator::IsValidAuthority(
                     std::get<absl::string_view>(value))) {
               status = MoqtErrorStatusWithCode("Invalid authority field",
@@ -319,18 +501,18 @@ absl::Status SetupParameters::FromKeyValuePairList(
             }
             authority = std::get<absl::string_view>(value);
             break;
-          case SetupParameter::kMoqtImplementation:
+          case SetupOption::kMoqtImplementation:
             if (moqt_implementation.has_value()) {
-              status = absl::InvalidArgumentError("Duplicate Setup Parameter");
+              status = absl::InvalidArgumentError("Duplicate Setup Option");
               return false;
             }
             QUICHE_LOG(INFO) << "Peer MOQT implementation: "
                              << std::get<absl::string_view>(value);
             moqt_implementation = std::get<absl::string_view>(value);
             break;
-          case SetupParameter::kSupportObjectAcks:
+          case SetupOption::kSupportObjectAcks:
             if (support_object_acks.has_value()) {
-              status = absl::InvalidArgumentError("Duplicate Setup Parameter");
+              status = absl::InvalidArgumentError("Duplicate Setup Option");
               return false;
             }
             if (std::get<uint64_t>(value) > 1) {
@@ -347,143 +529,8 @@ absl::Status SetupParameters::FromKeyValuePairList(
       });
   if (!result && status.ok()) {
     return absl::InvalidArgumentError(
-        absl::StrCat("Failed to parse the value for the setup parameter key 0x",
+        absl::StrCat("Failed to parse the value for the Setup Option key 0x",
                      absl::Hex(static_cast<uint64_t>(last_key))));
-  }
-  return status;
-}
-
-absl::Status MessageParameters::FromKeyValuePairList(
-    const KeyValuePairList& list) {
-  absl::Status status = absl::OkStatus();
-  uint64_t last_key;
-  bool result = list.ForEach([&](uint64_t key,
-                                 std::variant<uint64_t, absl::string_view>
-                                     value) {
-    last_key = key;
-    switch (static_cast<MessageParameter>(key)) {
-      case MessageParameter::kDeliveryTimeout:
-        if (delivery_timeout.has_value()) {
-          status = absl::InvalidArgumentError("Duplicate Message Parameter");
-          return false;
-        }
-        if (std::get<uint64_t>(value) == 0) {
-          status = absl::InvalidArgumentError("DELIVERY_TIMEOUT cannot be 0");
-          return false;
-        }
-        delivery_timeout =
-            quic::QuicTimeDelta::TryFromMilliseconds(std::get<uint64_t>(value))
-                .value_or(quic::QuicTimeDelta::Infinite());
-        break;
-      case MessageParameter::kAuthorizationToken:
-        if (!ParseAuthTokenParameter(std::get<absl::string_view>(value),
-                                     authorization_tokens)) {
-          status = KeyValueFormatError("Malformed auth token parameter");
-          return false;
-        }
-        break;
-      case MessageParameter::kExpires:
-        if (expires.has_value()) {
-          status = absl::InvalidArgumentError("Duplicate Message Parameter");
-          return false;
-        }
-        expires =
-            quic::QuicTimeDelta::TryFromMilliseconds(std::get<uint64_t>(value))
-                .value_or(quic::QuicTimeDelta::Infinite());
-        if (expires->IsZero()) {
-          expires = quic::QuicTimeDelta::Infinite();
-        }
-        break;
-      case MessageParameter::kLargestObject:
-        if (largest_object.has_value()) {
-          status = absl::InvalidArgumentError("Duplicate Message Parameter");
-          return false;
-        }
-        largest_object = Location();
-        if (!ParseLocation(std::get<absl::string_view>(value),
-                           *largest_object)) {
-          status = KeyValueFormatError(
-              "Failed to parse location of the largest object");
-          return false;
-        }
-        break;
-      case MessageParameter::kForward:
-        if (forward_has_value()) {
-          status = absl::InvalidArgumentError("Duplicate Message Parameter");
-          return false;
-        }
-        if (std::get<uint64_t>(value) > 1) {
-          status = absl::InvalidArgumentError("FORWARD must be 0 or 1");
-          return false;
-        }
-        set_forward(std::get<uint64_t>(value) != 0);
-        break;
-      case MessageParameter::kSubscriberPriority:
-        if (subscriber_priority.has_value()) {
-          status = absl::InvalidArgumentError("Duplicate Message Parameter");
-          return false;
-        }
-        if (std::get<uint64_t>(value) > kMaxPriority) {
-          status =
-              absl::InvalidArgumentError("Subscriber priority exceeds maximum");
-          return false;
-        }
-        subscriber_priority =
-            static_cast<MoqtPriority>(std::get<uint64_t>(value));
-        break;
-      case MessageParameter::kSubscriptionFilter:
-        if (subscription_filter.has_value()) {
-          status = absl::InvalidArgumentError("Duplicate Message Parameter");
-          // TODO(martinduke): Support multiple subscription filters.
-          return false;
-        }
-        status = ParseSubscriptionFilter(std::get<absl::string_view>(value),
-                                         subscription_filter);
-        if (!status.ok()) {
-          return false;
-        }
-        break;
-      case MessageParameter::kGroupOrder:
-        if (group_order.has_value()) {
-          status = absl::InvalidArgumentError("Duplicate Message Parameter");
-          return false;
-        }
-        if (std::get<uint64_t>(value) > kMaxMoqtDeliveryOrder ||
-            std::get<uint64_t>(value) < kMinMoqtDeliveryOrder) {
-          status = absl::InvalidArgumentError(
-              "GROUP_ORDER is outside the valid range");
-          return false;
-        }
-        group_order = static_cast<MoqtDeliveryOrder>(std::get<uint64_t>(value));
-        break;
-      case MessageParameter::kNewGroupRequest:
-        if (new_group_request.has_value()) {
-          status = absl::InvalidArgumentError("Duplicate Message Parameter");
-          return false;
-        }
-        new_group_request = std::get<uint64_t>(value);
-        break;
-      case MessageParameter::kOackWindowSize:
-        if (oack_window_size.has_value()) {
-          status = absl::InvalidArgumentError("Duplicate Message Parameter");
-          return false;
-        }
-        oack_window_size =
-            quic::QuicTimeDelta::FromMicroseconds(std::get<uint64_t>(value));
-        break;
-      default:
-        // Unknown MessageParameters not allowed!
-        status = absl::InvalidArgumentError(
-            absl::StrCat("Unknown message parameter 0x",
-                         absl::Hex(static_cast<uint64_t>(key))));
-        return false;
-    }
-    return true;
-  });
-  if (!result && status.ok()) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "Failed to parse the value for the message parameter key 0x",
-        absl::Hex(static_cast<uint64_t>(last_key))));
   }
   return status;
 }
@@ -516,7 +563,7 @@ absl::StatusOr<uint64_t> MoqtStreamTypeParser::ReadStreamType() {
   }
   bool fin_read = false;
   std::optional<uint64_t> type = ReadMoqVarIntFromStream(*stream_, fin_read);
-  if (fin_read && type != MoqtDataStreamType::kPadding) {
+  if (fin_read && type != kPaddingStreamType) {
     // Besides padding streams, all other streams require some data after the
     // type byte.
     status_ = absl::InvalidArgumentError(
@@ -645,10 +692,9 @@ absl::StatusOr<MoqtSetup> MoqtControlMessageParser::ProcessSetup(
     absl::string_view data) const {
   quic::QuicDataReader reader(data);
   MoqtSetup setup;
-  KeyValuePairList parameters;
-  QUICHE_RETURN_IF_ERROR(ParseKeyValuePairList(reader, parameters));
-  QUICHE_RETURN_IF_ERROR(
-      FillAndValidateSetupParameters(parameters, setup.parameters));
+  KeyValuePairList options;
+  QUICHE_RETURN_IF_ERROR(ParseKeyValuePairList(reader, options));
+  QUICHE_RETURN_IF_ERROR(FillAndValidateSetupOptions(options, setup.options));
   // TODO(martinduke): Validate construction of the PATH (Sec 8.3.2.1)
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
   return setup;
@@ -662,8 +708,11 @@ absl::StatusOr<MoqtSubscribe> MoqtControlMessageParser::ProcessSubscribe(
     return absl::InvalidArgumentError("Failed to read request ID");
   }
   QUICHE_RETURN_IF_ERROR(ReadFullTrackName(reader, subscribe.full_track_name));
-  QUICHE_RETURN_IF_ERROR(
-      FillAndValidateMessageParameters(reader, subscribe.parameters));
+  QUICHE_ASSIGN_OR_RETURN(subscribe.parameters, ParseMessageParameters(reader));
+  if (!ParametersAllowedByMessage(subscribe.parameters,
+                                  MoqtMessageType::kSubscribe)) {
+    return absl::InvalidArgumentError("Invalid SUBSCRIBE message parameters");
+  }
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
   return subscribe;
 }
@@ -672,19 +721,20 @@ absl::StatusOr<MoqtSubscribeOk> MoqtControlMessageParser::ProcessSubscribeOk(
     absl::string_view data) const {
   quic::QuicDataReader reader(data);
   MoqtSubscribeOk subscribe_ok;
-  if (!reader.ReadMoqVarInt(&subscribe_ok.request_id)) {
-    return absl::InvalidArgumentError("Failed to read the request ID");
-  }
   if (!reader.ReadMoqVarInt(&subscribe_ok.track_alias)) {
     return absl::InvalidArgumentError("Failed to read the track alias");
   }
-  KeyValuePairList pairs;
-  QUICHE_RETURN_IF_ERROR(ParseKeyValuePairList(reader, pairs));
-  QUICHE_RETURN_IF_ERROR(subscribe_ok.parameters.FromKeyValuePairList(pairs));
+  QUICHE_ASSIGN_OR_RETURN(subscribe_ok.parameters,
+                          ParseMessageParameters(reader));
+  if (!ParametersAllowedByMessage(subscribe_ok.parameters,
+                                  MoqtMessageType::kSubscribeOk)) {
+    return absl::InvalidArgumentError(
+        "Invalid SUBSCRIBE_OK message parameters");
+  }
   QUICHE_RETURN_IF_ERROR(
-      ParseKeyValuePairListWithNoPrefix(reader, subscribe_ok.extensions));
-  if (!subscribe_ok.extensions.Validate()) {
-    return absl::InvalidArgumentError("Invalid SUBSCRIBE_OK track extensions");
+      ParseKeyValuePairList(reader, subscribe_ok.properties));
+  if (!subscribe_ok.properties.Validate()) {
+    return absl::InvalidArgumentError("Invalid SUBSCRIBE_OK track properties");
   }
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
   return subscribe_ok;
@@ -696,8 +746,7 @@ absl::StatusOr<MoqtRequestError> MoqtControlMessageParser::ProcessRequestError(
   MoqtRequestError request_error;
   uint64_t error_code;
   uint64_t raw_interval;
-  if (!reader.ReadMoqVarInt(&request_error.request_id) ||
-      !reader.ReadMoqVarInt(&error_code) ||
+  if (!reader.ReadMoqVarInt(&error_code) ||
       !reader.ReadMoqVarInt(&raw_interval) ||
       !reader.ReadStringMoqVarInt(request_error.reason_phrase)) {
     return absl::InvalidArgumentError("Message missing fields");
@@ -708,6 +757,19 @@ absl::StatusOr<MoqtRequestError> MoqtControlMessageParser::ProcessRequestError(
           ? std::nullopt
           : std::make_optional(
                 quic::QuicTimeDelta::FromMilliseconds(raw_interval - 1));
+  if (request_error.error_code == RequestErrorCode::kRedirect) {
+    request_error.redirect.emplace();
+    if (!reader.ReadStringMoqVarInt(request_error.redirect->connect_uri)) {
+      return absl::InvalidArgumentError("Redirect missing connect URI");
+    }
+    if (perspective_ == quic::Perspective::IS_SERVER &&
+        !request_error.redirect->connect_uri.empty()) {
+      return absl::InvalidArgumentError(
+          "Connect URI must be empty from client");
+    }
+    QUICHE_RETURN_IF_ERROR(
+        ReadFullTrackName(reader, request_error.redirect->full_track_name));
+  }
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
   return request_error;
 }
@@ -717,8 +779,7 @@ absl::StatusOr<MoqtPublishDone> MoqtControlMessageParser::ProcessPublishDone(
   quic::QuicDataReader reader(data);
   MoqtPublishDone publish_done;
   uint64_t value;
-  if (!reader.ReadMoqVarInt(&publish_done.request_id) ||
-      !reader.ReadMoqVarInt(&value) ||
+  if (!reader.ReadMoqVarInt(&value) ||
       !reader.ReadMoqVarInt(&publish_done.stream_count) ||
       !reader.ReadStringMoqVarInt(publish_done.error_reason)) {
     return absl::InvalidArgumentError("Message missing fields");
@@ -732,12 +793,11 @@ absl::StatusOr<MoqtRequestUpdate>
 MoqtControlMessageParser::ProcessRequestUpdate(absl::string_view data) const {
   quic::QuicDataReader reader(data);
   MoqtRequestUpdate request_update;
-  if (!reader.ReadMoqVarInt(&request_update.request_id) ||
-      !reader.ReadMoqVarInt(&request_update.existing_request_id)) {
-    return absl::InvalidArgumentError("Message missing request IDs");
+  if (!reader.ReadMoqVarInt(&request_update.request_id)) {
+    return absl::InvalidArgumentError("Request ID missing");
   }
-  QUICHE_RETURN_IF_ERROR(
-      FillAndValidateMessageParameters(reader, request_update.parameters));
+  QUICHE_ASSIGN_OR_RETURN(request_update.parameters,
+                          ParseMessageParameters(reader));
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
   return request_update;
 }
@@ -752,8 +812,13 @@ MoqtControlMessageParser::ProcessPublishNamespace(
   }
   QUICHE_RETURN_IF_ERROR(
       ReadTrackNamespace(reader, publish_namespace.track_namespace));
-  QUICHE_RETURN_IF_ERROR(
-      FillAndValidateMessageParameters(reader, publish_namespace.parameters));
+  QUICHE_ASSIGN_OR_RETURN(publish_namespace.parameters,
+                          ParseMessageParameters(reader));
+  if (!ParametersAllowedByMessage(publish_namespace.parameters,
+                                  MoqtMessageType::kPublishNamespace)) {
+    return absl::InvalidArgumentError(
+        "Invalid PUBLISH_NAMESPACE message parameters");
+  }
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
   return publish_namespace;
 }
@@ -778,30 +843,76 @@ MoqtControlMessageParser::ProcessNamespaceDone(absl::string_view data) const {
   return namespace_done;
 }
 
+absl::StatusOr<MoqtPublishSkipped>
+MoqtControlMessageParser::ProcessPublishSkipped(absl::string_view data) const {
+  quic::QuicDataReader reader(data);
+  MoqtPublishSkipped publish_skipped;
+  QUICHE_RETURN_IF_ERROR(ReadFullTrackName(reader, publish_skipped.name));
+  QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
+  return publish_skipped;
+}
+
 absl::StatusOr<MoqtRequestOk> MoqtControlMessageParser::ProcessRequestOk(
     absl::string_view data) const {
   quic::QuicDataReader reader(data);
   MoqtRequestOk request_ok;
-  if (!reader.ReadMoqVarInt(&request_ok.request_id)) {
-    return absl::InvalidArgumentError("Request ID missing");
+  QUICHE_ASSIGN_OR_RETURN(request_ok.parameters,
+                          ParseMessageParameters(reader));
+  QUICHE_RETURN_IF_ERROR(ParseKeyValuePairList(reader, request_ok.properties));
+  if (!request_ok.properties.Validate()) {
+    return absl::InvalidArgumentError("Invalid REQUEST_OK track properties");
   }
-  QUICHE_RETURN_IF_ERROR(
-      FillAndValidateMessageParameters(reader, request_ok.parameters));
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
   return request_ok;
 }
 
 absl::StatusOr<MoqtTrackStatus> MoqtControlMessageParser::ProcessTrackStatus(
     absl::string_view data) const {
-  return ProcessSubscribe(data);
+  quic::QuicDataReader reader(data);
+  MoqtTrackStatus track_status;
+  if (!reader.ReadMoqVarInt(&track_status.request_id)) {
+    return absl::InvalidArgumentError("Failed to read request ID");
+  }
+  QUICHE_RETURN_IF_ERROR(
+      ReadFullTrackName(reader, track_status.full_track_name));
+  QUICHE_ASSIGN_OR_RETURN(track_status.parameters,
+                          ParseMessageParameters(reader));
+  if (!ParametersAllowedByMessage(track_status.parameters,
+                                  MoqtMessageType::kTrackStatus)) {
+    return absl::InvalidArgumentError(
+        "Invalid TRACK_STATUS message parameters");
+  }
+  QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
+  return track_status;
 }
 
 absl::StatusOr<MoqtGoAway> MoqtControlMessageParser::ProcessGoAway(
     absl::string_view data) const {
   quic::QuicDataReader reader(data);
   MoqtGoAway goaway;
+  uint64_t raw_timeout;
   if (!reader.ReadStringMoqVarInt(goaway.new_session_uri)) {
     return absl::InvalidArgumentError("Missing new session URI");
+  }
+  if (perspective_ == quic::Perspective::IS_SERVER &&
+      !goaway.new_session_uri.empty()) {
+    return absl::InvalidArgumentError(
+        "New session URI must be empty from client");
+  }
+  if (goaway.new_session_uri.length() > kMaxNewSessionUriLength) {
+    return absl::InvalidArgumentError("New session URI too long");
+  }
+  if (!reader.ReadMoqVarInt(&raw_timeout)) {
+    return absl::InvalidArgumentError("Missing GOAWAY timeout");
+  }
+  goaway.timeout = quic::QuicTimeDelta::TryFromMilliseconds(raw_timeout)
+                       .value_or(quic::QuicTimeDelta::Infinite());
+  if (!reader.IsDoneReading()) {
+    uint64_t request_id;
+    if (!reader.ReadMoqVarInt(&request_id)) {
+      return absl::InvalidArgumentError("Invalid GOAWAY request ID");
+    }
+    goaway.request_id = request_id;
   }
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
   return goaway;
@@ -817,8 +928,13 @@ MoqtControlMessageParser::ProcessSubscribeNamespace(
   }
   QUICHE_RETURN_IF_ERROR(
       ReadTrackNamespace(reader, subscribe_namespace.track_namespace_prefix));
-  QUICHE_RETURN_IF_ERROR(
-      FillAndValidateMessageParameters(reader, subscribe_namespace.parameters));
+  QUICHE_ASSIGN_OR_RETURN(subscribe_namespace.parameters,
+                          ParseMessageParameters(reader));
+  if (!ParametersAllowedByMessage(subscribe_namespace.parameters,
+                                  MoqtMessageType::kSubscribeNamespace)) {
+    return absl::InvalidArgumentError(
+        "Invalid SUBSCRIBE_NAMESPACE message parameters");
+  }
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
   return subscribe_namespace;
 }
@@ -832,21 +948,15 @@ MoqtControlMessageParser::ProcessSubscribeTracks(absl::string_view data) const {
   }
   QUICHE_RETURN_IF_ERROR(
       ReadTrackNamespace(reader, subscribe_tracks.track_namespace_prefix));
-  QUICHE_RETURN_IF_ERROR(
-      FillAndValidateMessageParameters(reader, subscribe_tracks.parameters));
-  QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
-  return subscribe_tracks;
-}
-
-absl::StatusOr<MoqtMaxRequestId> MoqtControlMessageParser::ProcessMaxRequestId(
-    absl::string_view data) const {
-  quic::QuicDataReader reader(data);
-  MoqtMaxRequestId max_request_id;
-  if (!reader.ReadMoqVarInt(&max_request_id.max_request_id)) {
-    return absl::InvalidArgumentError("Max request ID missing");
+  QUICHE_ASSIGN_OR_RETURN(subscribe_tracks.parameters,
+                          ParseMessageParameters(reader));
+  if (!ParametersAllowedByMessage(subscribe_tracks.parameters,
+                                  MoqtMessageType::kSubscribeTracks)) {
+    return absl::InvalidArgumentError(
+        "Invalid SUBSCRIBE_TRACKS message parameters");
   }
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
-  return max_request_id;
+  return subscribe_tracks;
 }
 
 absl::StatusOr<MoqtFetch> MoqtControlMessageParser::ProcessFetch(
@@ -908,8 +1018,10 @@ absl::StatusOr<MoqtFetch> MoqtControlMessageParser::ProcessFetch(
     default:
       return absl::InvalidArgumentError("Invalid FETCH type");
   }
-  QUICHE_RETURN_IF_ERROR(
-      FillAndValidateMessageParameters(reader, fetch.parameters));
+  QUICHE_ASSIGN_OR_RETURN(fetch.parameters, ParseMessageParameters(reader));
+  if (!ParametersAllowedByMessage(fetch.parameters, MoqtMessageType::kFetch)) {
+    return absl::InvalidArgumentError("Invalid FETCH message parameters");
+  }
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
   return fetch;
 }
@@ -919,8 +1031,7 @@ absl::StatusOr<MoqtFetchOk> MoqtControlMessageParser::ProcessFetchOk(
   quic::QuicDataReader reader(data);
   MoqtFetchOk fetch_ok;
   uint8_t end_of_track;
-  if (!reader.ReadMoqVarInt(&fetch_ok.request_id) ||
-      !reader.ReadUInt8(&end_of_track) ||
+  if (!reader.ReadUInt8(&end_of_track) ||
       !reader.ReadMoqVarInt(&fetch_ok.end_location.group) ||
       !reader.ReadMoqVarInt(&fetch_ok.end_location.object)) {
     return absl::InvalidArgumentError("Message missing fields");
@@ -934,37 +1045,17 @@ absl::StatusOr<MoqtFetchOk> MoqtControlMessageParser::ProcessFetchOk(
     --fetch_ok.end_location.object;
   }
   fetch_ok.end_of_track = end_of_track == 1;
-  QUICHE_RETURN_IF_ERROR(
-      FillAndValidateMessageParameters(reader, fetch_ok.parameters));
-  QUICHE_RETURN_IF_ERROR(
-      ParseKeyValuePairListWithNoPrefix(reader, fetch_ok.extensions));
-  if (!fetch_ok.extensions.Validate()) {
-    return absl::InvalidArgumentError("Invalid FETCH_OK track extensions");
+  QUICHE_ASSIGN_OR_RETURN(fetch_ok.parameters, ParseMessageParameters(reader));
+  if (!ParametersAllowedByMessage(fetch_ok.parameters,
+                                  MoqtMessageType::kFetchOk)) {
+    return absl::InvalidArgumentError("Invalid FETCH_OK message parameters");
+  }
+  QUICHE_RETURN_IF_ERROR(ParseKeyValuePairList(reader, fetch_ok.properties));
+  if (!fetch_ok.properties.Validate()) {
+    return absl::InvalidArgumentError("Invalid FETCH_OK track properties");
   }
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
   return fetch_ok;
-}
-
-absl::StatusOr<MoqtFetchCancel> MoqtControlMessageParser::ProcessFetchCancel(
-    absl::string_view data) const {
-  quic::QuicDataReader reader(data);
-  MoqtFetchCancel fetch_cancel;
-  if (!reader.ReadMoqVarInt(&fetch_cancel.request_id)) {
-    return absl::InvalidArgumentError("Request ID missing");
-  }
-  QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
-  return fetch_cancel;
-}
-
-absl::StatusOr<MoqtRequestsBlocked>
-MoqtControlMessageParser::ProcessRequestsBlocked(absl::string_view data) const {
-  quic::QuicDataReader reader(data);
-  MoqtRequestsBlocked requests_blocked;
-  if (!reader.ReadMoqVarInt(&requests_blocked.max_request_id)) {
-    return absl::InvalidArgumentError("Max request ID missing");
-  }
-  QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
-  return requests_blocked;
 }
 
 absl::StatusOr<MoqtPublish> MoqtControlMessageParser::ProcessPublish(
@@ -979,12 +1070,14 @@ absl::StatusOr<MoqtPublish> MoqtControlMessageParser::ProcessPublish(
   if (!reader.ReadMoqVarInt(&publish.track_alias)) {
     return absl::InvalidArgumentError("Track alias missing");
   }
-  QUICHE_RETURN_IF_ERROR(
-      FillAndValidateMessageParameters(reader, publish.parameters));
-  QUICHE_RETURN_IF_ERROR(
-      ParseKeyValuePairListWithNoPrefix(reader, publish.extensions));
-  if (!publish.extensions.Validate()) {
-    return absl::InvalidArgumentError("Invalid PUBLISH track extensions");
+  QUICHE_ASSIGN_OR_RETURN(publish.parameters, ParseMessageParameters(reader));
+  if (!ParametersAllowedByMessage(publish.parameters,
+                                  MoqtMessageType::kPublish)) {
+    return absl::InvalidArgumentError("Invalid PUBLISH message parameters");
+  }
+  QUICHE_RETURN_IF_ERROR(ParseKeyValuePairList(reader, publish.properties));
+  if (!publish.properties.Validate()) {
+    return absl::InvalidArgumentError("Invalid PUBLISH track properties");
   }
   QUICHE_RETURN_IF_ERROR(CheckForTrailingData(reader));
   return publish;
@@ -1006,63 +1099,14 @@ absl::StatusOr<MoqtObjectAck> MoqtControlMessageParser::ProcessObjectAck(
   return object_ack;
 }
 
-absl::Status MoqtControlMessageParser::ReadTrackNamespace(
-    quic::QuicDataReader& reader, TrackNamespace& track_namespace) const {
-  QUICHE_DCHECK(track_namespace.empty());
-  uint64_t num_elements;
-  if (!reader.ReadMoqVarInt(&num_elements)) {
-    return absl::InvalidArgumentError(
-        "Unable to parse the number of namespace elements");
-  }
-  if (num_elements == 0 || num_elements > kMaxNamespaceElements) {
-    return absl::InvalidArgumentError("Invalid number of namespace elements");
-  }
-  absl::FixedArray<absl::string_view> elements(num_elements);
-  for (uint64_t i = 0; i < num_elements; ++i) {
-    if (!reader.ReadStringPieceMoqVarInt(&elements[i])) {
-      return absl::InvalidArgumentError(
-          "Namespace element shorter than specified");
-    }
-  }
-  if (!track_namespace.Append(elements)) {
-    return absl::InvalidArgumentError("Track namespace is too large");
-  }
-  return absl::OkStatus();
-}
-
-absl::Status MoqtControlMessageParser::ReadFullTrackName(
-    quic::QuicDataReader& reader, FullTrackName& full_track_name) const {
-  QUICHE_DCHECK(!full_track_name.IsValid());
-  TrackNamespace track_namespace;
-  QUICHE_RETURN_IF_ERROR(ReadTrackNamespace(reader, track_namespace));
-  absl::string_view name;
-  if (!reader.ReadStringPieceMoqVarInt(&name)) {
-    return absl::InvalidArgumentError("Unable to parse track name");
-  }
-  absl::StatusOr<FullTrackName> full_track_name_or =
-      FullTrackName::Create(std::move(track_namespace), std::string(name));
-  QUICHE_RETURN_IF_ERROR(full_track_name_or.status());
-  full_track_name = *std::move(full_track_name_or);
-  return absl::OkStatus();
-}
-
-absl::Status MoqtControlMessageParser::FillAndValidateSetupParameters(
-    const KeyValuePairList& in, SetupParameters& out) const {
+absl::Status MoqtControlMessageParser::FillAndValidateSetupOptions(
+    const KeyValuePairList& in, SetupOptions& out) const {
   QUICHE_RETURN_IF_ERROR(out.FromKeyValuePairList(in));
-  MoqtError error = SetupParametersAllowedByMessage(
+  MoqtError error = SetupOptionsAllowedByMessage(
       out, FlipPerspective(perspective_), uses_web_transport_);
   if (error != MoqtError::kNoError) {
-    return MoqtErrorStatusWithCode("Setup parameter parsing error", error);
+    return MoqtErrorStatusWithCode("Setup option parsing error", error);
   }
-  return absl::OkStatus();
-}
-
-absl::Status MoqtControlMessageParser::FillAndValidateMessageParameters(
-    quic::QuicDataReader& reader, MessageParameters& out) const {
-  KeyValuePairList pairs;
-  QUICHE_RETURN_IF_ERROR(ParseKeyValuePairList(reader, pairs));
-  // All parameter types are allowed in all messages.
-  QUICHE_RETURN_IF_ERROR(out.FromKeyValuePairList(pairs));
   return absl::OkStatus();
 }
 
@@ -1086,37 +1130,41 @@ void MoqtDataParser::ParseError(absl::string_view reason) {
   visitor_.OnParsingError(MoqtError::kProtocolViolation, reason);
 }
 
-std::optional<absl::string_view> ParseDatagram(absl::string_view data,
-                                               MoqtObject& object_metadata,
-                                               bool& use_default_priority) {
+absl::StatusOr<absl::string_view> ParseDatagram(absl::string_view data,
+                                                MoqtObject& object_metadata,
+                                                bool& use_default_priority) {
   uint64_t type_raw, object_status_raw;
-  absl::string_view extensions;
+  absl::string_view properties;
   quic::QuicDataReader reader(data);
   object_metadata = MoqtObject();
-  if (!reader.ReadMoqVarInt(&type_raw) ||
-      !reader.ReadMoqVarInt(&object_metadata.track_alias) ||
-      !reader.ReadMoqVarInt(&object_metadata.group_id)) {
-    return std::nullopt;
+  if (!reader.ReadMoqVarInt(&type_raw)) {
+    return absl::InvalidArgumentError("Failed to parse datagram");
   }
-
+  if (type_raw == kPaddingDatagramType) {
+    return absl::NotFoundError("Padding datagram");
+  }
   std::optional<MoqtDatagramType> datagram_type =
       MoqtDatagramType::FromValue(type_raw);
   if (!datagram_type.has_value()) {
-    return std::nullopt;
+    return absl::InvalidArgumentError("Failed to parse datagram");
+  }
+  if (!reader.ReadMoqVarInt(&object_metadata.track_alias) ||
+      !reader.ReadMoqVarInt(&object_metadata.group_id)) {
+    return absl::InvalidArgumentError("Failed to parse datagram");
   }
   if (datagram_type->end_of_group()) {
     object_metadata.object_status = MoqtObjectStatus::kEndOfGroup;
     if (datagram_type->has_status()) {
       QUICHE_BUG(Moqt_invalid_datagram_type)
           << "Invalid datagram type: " << type_raw;
-      return std::nullopt;
+      return absl::InvalidArgumentError("Failed to parse datagram");
     }
   } else {
     object_metadata.object_status = MoqtObjectStatus::kNormal;
   }
   if (datagram_type->has_object_id()) {
     if (!reader.ReadMoqVarInt(&object_metadata.object_id)) {
-      return std::nullopt;
+      return absl::InvalidArgumentError("Failed to parse datagram");
     }
   } else {
     object_metadata.object_id = 0;
@@ -1125,24 +1173,28 @@ std::optional<absl::string_view> ParseDatagram(absl::string_view data,
   use_default_priority = datagram_type->has_default_priority();
   if (!use_default_priority &&
       !reader.ReadUInt8(&object_metadata.publisher_priority)) {
-    return std::nullopt;
+    return absl::InvalidArgumentError("Failed to parse datagram");
   }
-  if (datagram_type->has_extension()) {
-    if (!reader.ReadStringPieceMoqVarInt(&extensions)) {
-      return std::nullopt;
+  if (datagram_type->has_properties()) {
+    if (!reader.ReadStringPieceMoqVarInt(&properties)) {
+      return absl::InvalidArgumentError("Failed to parse datagram");
     }
-    if (extensions.empty()) {
+    if (properties.empty()) {
       // This is a session error.
-      return std::nullopt;
+      return absl::InvalidArgumentError("Failed to parse datagram");
     }
-    object_metadata.extension_headers = std::string(extensions);
+    object_metadata.properties = std::string(properties);
   }
   if (datagram_type->has_status()) {
     object_metadata.payload_length = 0;
     if (!reader.ReadMoqVarInt(&object_status_raw)) {
-      return std::nullopt;
+      return absl::InvalidArgumentError("Failed to parse datagram");
     }
     object_metadata.object_status = IntegerToObjectStatus(object_status_raw);
+    if (datagram_type->has_properties() &&
+        object_metadata.object_status != MoqtObjectStatus::kNormal) {
+      return absl::InvalidArgumentError("Datagram has status and properties");
+    }
     return "";
   }
   absl::string_view payload = reader.ReadRemainingPayload();
@@ -1204,7 +1256,9 @@ MoqtDataParser::NextInput MoqtDataParser::AdvanceParserState() {
       case kGroupId:
         if (fetch_serialization_.is_datagram()) {
           metadata_.subgroup_id = std::nullopt;
-        } else {
+        } else if (!fetch_serialization_.end_of_non_existent_range() &&
+                   !fetch_serialization_.end_of_unknown_range()) {
+          // Object ranges do not set the subgroup.
           if (fetch_serialization_.has_subgroup_id()) {
             return kSubgroupId;
           }
@@ -1227,7 +1281,11 @@ MoqtDataParser::NextInput MoqtDataParser::AdvanceParserState() {
         if (fetch_serialization_.has_object_id()) {
           return kObjectId;
         }
-        ++metadata_.object_id;
+        if (!quiche::SafeIncrementBy<uint64_t>(metadata_.object_id, 1)) {
+          ParseError("Integer overflow when parsing object ID");
+          return kFailed;
+        }
+        last_object_id_ = metadata_.object_id;
         [[fallthrough]];
       case kObjectId:
         if (fetch_serialization_.end_of_non_existent_range() ||
@@ -1239,21 +1297,20 @@ MoqtDataParser::NextInput MoqtDataParser::AdvanceParserState() {
         }
         [[fallthrough]];
       case kPublisherPriority:
-        if (fetch_serialization_.has_extensions()) {
-          return kExtensionSize;
+        if (fetch_serialization_.has_properties()) {
+          return kPropertiesSize;
         }
-        metadata_.extension_headers = "";
+        metadata_.properties = "";
         return kObjectPayloadLength;
-      case kExtensionBody:
+      case kPropertiesBody:
         return kObjectPayloadLength;
       case kData:
         return kSerializationFlags;
       case kTrackAlias:
       case kObjectPayloadLength:
-      case kAwaitingNextByte:
       case kStatus:
       case kFailed:
-      case kExtensionSize:
+      case kPropertiesSize:
       case kPadding:
         QUICHE_NOTREACHED();
         return next_input_;
@@ -1291,19 +1348,18 @@ MoqtDataParser::NextInput MoqtDataParser::AdvanceParserState() {
         metadata_.first_object_in_subgroup =
             type_.HasFirstObject() && num_objects_read_ == 0;
       }
-      if (type_.AreExtensionHeadersPresent()) {
-        return kExtensionSize;
+      if (type_.ArePropertiesPresent()) {
+        return kPropertiesSize;
       }
       [[fallthrough]];
-    case kExtensionBody:
+    case kPropertiesBody:
       return kObjectPayloadLength;
     case kStatus:
     case kData:
-    case kAwaitingNextByte:
       return kObjectId;
     case kRequestId:
     case kSerializationFlags:
-    case kExtensionSize:
+    case kPropertiesSize:
     case kObjectPayloadLength:
     case kPadding:
     case kFailed:
@@ -1349,13 +1405,18 @@ void MoqtDataParser::ParseNextItemFromStream() {
           ParseError("Invalid serialization flags");
           return;
         }
-        if (num_objects_read_ == 0 &&
+        if (num_objects_read_ == 0 && (!serialization->has_object_id() ||
+                                       !serialization->has_group_id())) {
+          ParseError("Invalid serialization flags for first object");
+          return;
+        }
+        if (!non_fetch_range_object_read_ &&
+            !serialization->end_of_non_existent_range() &&
+            !serialization->end_of_unknown_range() &&
             (serialization->prior_subgroup_id() ||
              serialization->prior_subgroup_id_plus_one() ||
-             !serialization->has_object_id() ||
-             !serialization->has_group_id() ||
              !serialization->has_priority())) {
-          ParseError("Invalid serialization flags for first object");
+          ParseError("Invalid reference to prior object");
           return;
         }
         fetch_serialization_ = *serialization;
@@ -1365,17 +1426,41 @@ void MoqtDataParser::ParseNextItemFromStream() {
     }
 
     case kGroupId: {
-      std::optional<uint64_t> value_read = ReadMoqVarIntNoFin();
-      if (value_read.has_value()) {
-        if (type_.IsFetch() ||
-            !fetch_serialization_.end_of_non_existent_range() ||
-            !fetch_serialization_.end_of_unknown_range()) {
-          // Do not record range indicator group IDs because it will corrupt
-          // references to the previous object.
-          metadata_.group_id = *value_read;
-        }
-        next_input_ = AdvanceParserState();
+      if (type_.IsFetch() && !group_order_.has_value()) {
+        // Check before reading the group ID to avoid wrecking parser state.
+        QUICHE_BUG(MoqtDataParser_no_group_order)
+            << "Data parser group order not set";
+        return;
       }
+      std::optional<uint64_t> value_read = ReadMoqVarIntNoFin();
+      if (!value_read.has_value()) {
+        return;
+      }
+      if (type_.IsFetch() && last_group_id_.has_value()) {
+        // Diff-encoded group ID.
+        std::optional<uint64_t> new_group_id;
+        if (!group_order_.has_value()) {
+          // Exit to satisfy ClangTidy.
+          return;
+        }
+        if (*group_order_ == MoqtGroupOrder::kAscending) {
+          new_group_id =
+              quiche::SafeSum<uint64_t>({*value_read, *last_group_id_, 1});
+        } else {
+          new_group_id = (*value_read < *last_group_id_)
+                             ? (*last_group_id_ - *value_read - 1)
+                             : std::optional<uint64_t>();
+        }
+        if (!new_group_id.has_value()) {
+          ParseError("Integer overflow when parsing group ID");
+          return;
+        }
+        metadata_.group_id = *new_group_id;
+      } else {
+        metadata_.group_id = *value_read;
+      }
+      last_group_id_ = metadata_.group_id;
+      next_input_ = AdvanceParserState();
       return;
     }
 
@@ -1398,39 +1483,60 @@ void MoqtDataParser::ParseNextItemFromStream() {
     }
 
     case kObjectId: {
-      std::optional<uint64_t> value_read = ReadMoqVarIntNoFin();
-      if (value_read.has_value()) {
-        if (type_.IsFetch() ||
-            !fetch_serialization_.end_of_non_existent_range() ||
-            !fetch_serialization_.end_of_unknown_range()) {
-          // Do not record range indicator object IDs because it will corrupt
-          // references to the previous object.
-          if (type_.IsSubgroup() && last_object_id_.has_value()) {
-            std::optional<uint64_t> new_object_id =
-                quiche::SafeSum<uint64_t>({*value_read, *last_object_id_, 1});
-            if (!new_object_id.has_value()) {
-              ParseError("Integer overflow when parsing object ID");
-              return;
-            }
-            metadata_.object_id = *new_object_id;
-          } else {
-            metadata_.object_id = *value_read;
-          }
+      bool fin_read = false;
+      std::optional<uint64_t> value_read =
+          ReadMoqVarIntFromStream(stream_, fin_read);
+      if (!value_read.has_value()) {
+        if (fin_read) {
+          ParseError("FIN received at an unexpected point in the stream");
         }
-        last_object_id_ = metadata_.object_id;
-        next_input_ = AdvanceParserState();
+        return;
       }
-      // TODO(martinduke): Report something if the fetch serialization is an end
-      // of range indicator.
+      if (last_object_id_.has_value() &&
+          (type_.IsSubgroup() || !fetch_serialization_.has_group_id())) {
+        if (type_.IsFetch() && *value_read == 0) {
+          ParseError("Duplicate object ID in FETCH stream");
+          return;
+        }
+        std::optional<uint64_t> new_object_id = quiche::SafeSum<uint64_t>(
+            {*value_read, *last_object_id_,
+             type_.IsSubgroup() ? uint64_t{1} : uint64_t{0}});
+        if (!new_object_id.has_value()) {
+          ParseError("Integer overflow when parsing object ID");
+          return;
+        }
+        metadata_.object_id = *new_object_id;
+      } else {
+        metadata_.object_id = *value_read;
+      }
+      last_object_id_ = metadata_.object_id;
+      if (type_.IsFetch() &&
+          (fetch_serialization_.end_of_non_existent_range() ||
+           fetch_serialization_.end_of_unknown_range())) {
+        metadata_.object_status =
+            static_cast<MoqtObjectStatus>(fetch_serialization_.value());
+        visitor_.OnObjectMessage(metadata_, "", /*end_of_message=*/true);
+        ++num_objects_read_;
+        if (fin_read) {
+          visitor_.OnFin();
+          no_more_data_ = true;
+          return;
+        }
+      } else if (fin_read) {
+        ParseError("FIN received at an unexpected point in the stream");
+        return;
+      }
+      next_input_ = AdvanceParserState();
       return;
     }
 
-    case kExtensionSize: {
+    case kPropertiesSize: {
       std::optional<uint64_t> value_read = ReadMoqVarIntNoFin();
       if (value_read.has_value()) {
-        metadata_.extension_headers.clear();
+        metadata_.properties.clear();
         payload_length_remaining_ = *value_read;
-        next_input_ = (value_read == 0) ? kObjectPayloadLength : kExtensionBody;
+        next_input_ =
+            (value_read == 0) ? kObjectPayloadLength : kPropertiesBody;
       }
       return;
     }
@@ -1460,7 +1566,11 @@ void MoqtDataParser::ParseNextItemFromStream() {
           ParseError("Invalid object status provided");
           return;
         }
-
+        if (metadata_.object_status != MoqtObjectStatus::kNormal &&
+            !metadata_.properties.empty()) {
+          ParseError("Object has status and properties");
+          return;
+        }
         ++num_objects_read_;
         // TODO(martinduke): If contains_end_of_group_ && fin_read, the track is
         // malformed. There is no API to signal this to the session yet, but the
@@ -1468,6 +1578,7 @@ void MoqtDataParser::ParseNextItemFromStream() {
         // spec. Don't bother to signal this for now; just ignore that the
         // stream was supposed to conclude with kEndOfGroup and end it with the
         // encoded status instead.
+        non_fetch_range_object_read_ = true;
         visitor_.OnObjectMessage(metadata_, "", /*end_of_message=*/true);
         next_input_ = AdvanceParserState();
       }
@@ -1479,7 +1590,7 @@ void MoqtDataParser::ParseNextItemFromStream() {
       return;
     }
 
-    case kExtensionBody:
+    case kPropertiesBody:
     case kData: {
       while (payload_length_remaining_ > 0) {
         webtransport::Stream::PeekResult peek_result =
@@ -1498,15 +1609,12 @@ void MoqtDataParser::ParseNextItemFromStream() {
             ParseError("FIN received at an unexpected point in the stream");
             return;
           }
-          if (contains_end_of_group_) {
-            if (no_more_data_) {
-              metadata_.object_status = MoqtObjectStatus::kEndOfGroup;
-            } else if (done) {
-              // Don't signal done until the next byte arrives.
-              next_input_ = kAwaitingNextByte;
-              done = false;
-            }
+          if (contains_end_of_group_ && no_more_data_) {
+            // It's OK to change status mid-object because it's a convenience
+            // signal for the parser, not immutable metadata.
+            metadata_.object_status = MoqtObjectStatus::kEndOfGroup;
           }
+          non_fetch_range_object_read_ = true;
           visitor_.OnObjectMessage(
               metadata_, peek_result.peeked_data.substr(0, chunk_size), done);
           if (done) {
@@ -1526,7 +1634,7 @@ void MoqtDataParser::ParseNextItemFromStream() {
             }
           }
         } else {
-          absl::StrAppend(&metadata_.extension_headers,
+          absl::StrAppend(&metadata_.properties,
                           peek_result.peeked_data.substr(0, chunk_size));
           if (stream_.SkipBytes(chunk_size)) {
             ParseError("FIN received at an unexpected point in the stream");
@@ -1538,11 +1646,6 @@ void MoqtDataParser::ParseNextItemFromStream() {
           }
         }
       }
-      return;
-    }
-
-    case kAwaitingNextByte: {
-      QUICHE_NOTREACHED();  // CheckForFinWithoutData() should have handled it.
       return;
     }
 
@@ -1574,13 +1677,10 @@ void MoqtDataParser::ReadAtMostOneObject() {
 }
 
 bool MoqtDataParser::CheckForFinWithoutData() {
+  if (no_more_data_) {
+    return true;
+  }
   if (!stream_.PeekNextReadableRegion().fin_next) {
-    if (next_input_ == kAwaitingNextByte) {
-      // Data arrived; the last object was not EndOfGroup.
-      visitor_.OnObjectMessage(metadata_, "", /*end_of_message=*/true);
-      next_input_ = AdvanceParserState();
-      ++num_objects_read_;
-    }
     return false;
   }
   no_more_data_ = true;
@@ -1592,9 +1692,23 @@ bool MoqtDataParser::CheckForFinWithoutData() {
     ParseError("FIN received at an unexpected point in the stream");
     return true;
   }
-  if (next_input_ == kAwaitingNextByte) {
-    metadata_.object_status = MoqtObjectStatus::kEndOfGroup;
-    visitor_.OnObjectMessage(metadata_, "", /*end_of_message=*/true);
+  if (contains_end_of_group_ && last_object_id_.has_value() &&
+      *last_object_id_ < kMaxObjectId &&
+      metadata_.object_status == MoqtObjectStatus::kNormal) {
+    // Send a synthetic END_OF_GROUP object.
+    MoqtObject object = {
+        .track_alias = metadata_.track_alias,
+        .group_id = metadata_.group_id,
+        .object_id = *last_object_id_ + 1,
+        .publisher_priority = metadata_.publisher_priority,
+        .properties = "",
+        .object_status = MoqtObjectStatus::kEndOfGroup,
+        .subgroup_id = metadata_.subgroup_id,
+        .first_object_in_subgroup = false,
+        .payload_length = 0,
+    };
+    ++num_objects_read_;
+    visitor_.OnObjectMessage(object, "", /*end_of_message=*/true);
   }
   visitor_.OnFin();
   return stream_.SkipBytes(0);
@@ -1608,10 +1722,6 @@ void MoqtDataParser::ProcessStreamType(uint64_t raw_type) {
     return;
   }
   type_ = *type;
-  if (type_.IsPadding()) {
-    next_input_ = kPadding;
-    return;
-  }
   if (type_.EndOfGroupInStream()) {
     contains_end_of_group_ = true;
   }

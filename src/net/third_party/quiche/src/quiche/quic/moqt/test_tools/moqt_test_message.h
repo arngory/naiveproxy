@@ -31,21 +31,20 @@
 #include "quiche/common/moq_varint.h"
 #include "quiche/common/platform/api/quiche_export.h"
 #include "quiche/common/platform/api/quiche_logging.h"
-#include "quiche/common/quiche_endian.h"
 
 namespace moqt::test {
 
-inline constexpr absl::string_view kDefaultExtensionBlob(
+inline constexpr absl::string_view kDefaultPropertyBlob(
     "\x00\x0c\x01\x03\x66\x6f\x6f", 7);
 
 inline std::vector<MoqtDatagramType> AllMoqtDatagramTypes() {
   std::vector<MoqtDatagramType> types;
   for (bool payload : {false, true}) {
-    for (bool extension : {false, true}) {
+    for (bool property : {false, true}) {
       for (bool end_of_group : {false, true}) {
         for (bool default_priority : {false, true}) {
           for (bool zero_object_id : {false, true}) {
-            types.push_back(MoqtDatagramType(payload, extension, end_of_group,
+            types.push_back(MoqtDatagramType(payload, property, end_of_group,
                                              default_priority, zero_object_id));
           }
         }
@@ -75,13 +74,13 @@ inline std::vector<MoqtDataStreamType> AllMoqtDataStreamTypes() {
   types.push_back(MoqtDataStreamType::Fetch());
   uint64_t first_object_id = 1;
   for (uint64_t subgroup_id : {0, 1, 2}) {
-    for (bool no_extension_headers : {true, false}) {
+    for (bool no_properties : {true, false}) {
       for (bool default_priority : {true, false}) {
         for (bool has_first_object : {true, false}) {
           for (bool end_of_group : {false, true}) {
             types.push_back(MoqtDataStreamType::Subgroup(
-                subgroup_id, first_object_id, no_extension_headers,
-                default_priority, has_first_object, end_of_group));
+                subgroup_id, first_object_id, no_properties, default_priority,
+                has_first_object, end_of_group));
           }
         }
       }
@@ -92,13 +91,15 @@ inline std::vector<MoqtDataStreamType> AllMoqtDataStreamTypes() {
 
 inline MessageParameters SubscribeForTest() {
   MessageParameters parameters;
-  parameters.delivery_timeout = quic::QuicTimeDelta::FromMilliseconds(10000);
+  parameters.object_delivery_timeout =
+      quic::QuicTimeDelta::FromMilliseconds(10000);
   parameters.authorization_tokens.emplace_back(AuthTokenType::kOutOfBand,
                                                "bar");
+  parameters.rendezvous_timeout = quic::QuicTimeDelta::FromMilliseconds(100);
   parameters.set_forward(true);
   parameters.subscriber_priority = 0x20;
   parameters.subscription_filter.emplace(Location(4, 1));
-  parameters.group_order = MoqtDeliveryOrder::kDescending;
+  parameters.group_order = MoqtGroupOrder::kDescending;
   return parameters;
 }
 
@@ -117,9 +118,8 @@ class QUICHE_NO_EXPORT TestMessageBase {
                    MoqtSubscribe, MoqtSubscribeOk, MoqtPublishDone,
                    MoqtRequestUpdate, MoqtPublishNamespace, MoqtTrackStatus,
                    MoqtGoAway, MoqtSubscribeNamespace, MoqtSubscribeTracks,
-                   MoqtMaxRequestId, MoqtFetch, MoqtFetchCancel, MoqtFetchOk,
-                   MoqtRequestsBlocked, MoqtPublish, MoqtNamespace,
-                   MoqtNamespaceDone, MoqtObjectAck>;
+                   MoqtFetch, MoqtFetchOk, MoqtPublish, MoqtNamespace,
+                   MoqtNamespaceDone, MoqtPublishSkipped, MoqtObjectAck>;
 
   // The total actual size of the message.
   size_t total_message_size() const { return wire_image_size_; }
@@ -253,8 +253,8 @@ class QUICHE_NO_EXPORT ObjectMessage : public TestMessageBase {
       QUIC_LOG(INFO) << "OBJECT Publisher Priority mismatch";
       return false;
     }
-    if (cast.extension_headers != object_.extension_headers) {
-      QUIC_LOG(INFO) << "OBJECT Extension Header mismatch";
+    if (cast.properties != object_.properties) {
+      QUIC_LOG(INFO) << "OBJECT Property Header mismatch";
       return false;
     }
     if (cast.object_status != object_.object_status) {
@@ -282,7 +282,7 @@ class QUICHE_NO_EXPORT ObjectMessage : public TestMessageBase {
       .group_id = 5,
       .object_id = 6,
       .publisher_priority = 7,
-      .extension_headers = std::string(kDefaultExtensionBlob),
+      .properties = std::string(kDefaultPropertyBlob),
       .object_status = MoqtObjectStatus::kNormal,
       .subgroup_id = 8,
       .first_object_in_subgroup = false,
@@ -296,7 +296,9 @@ class QUICHE_NO_EXPORT ObjectDatagramMessage : public ObjectMessage {
       : ObjectMessage(), datagram_type_(datagram_type) {
     // Update ObjectMessage::object_ to match the datagram type.
     if (datagram_type.has_status()) {
-      object_.object_status = MoqtObjectStatus::kObjectDoesNotExist;
+      object_.object_status = datagram_type.has_properties()
+                                  ? MoqtObjectStatus::kNormal
+                                  : MoqtObjectStatus::kEndOfTrack;
       object_.payload_length = 0;
     } else {
       object_.object_status = datagram_type.end_of_group()
@@ -304,8 +306,8 @@ class QUICHE_NO_EXPORT ObjectDatagramMessage : public ObjectMessage {
                                   : MoqtObjectStatus::kNormal;
       object_.payload_length = 3;
     }
-    object_.extension_headers =
-        datagram_type.has_extension() ? std::string(kDefaultExtensionBlob) : "";
+    object_.properties =
+        datagram_type.has_properties() ? std::string(kDefaultPropertyBlob) : "";
     object_.object_id = datagram_type.has_object_id() ? 6 : 0;
     object_.subgroup_id = std::nullopt;
     quic::QuicDataWriter writer(sizeof(raw_packet_),
@@ -318,8 +320,8 @@ class QUICHE_NO_EXPORT ObjectDatagramMessage : public ObjectMessage {
     if (!datagram_type.has_default_priority()) {
       EXPECT_TRUE(writer.WriteStringPiece(kRawPriority));
     }
-    if (datagram_type.has_extension()) {
-      EXPECT_TRUE(writer.WriteStringPiece(kRawExtensions));
+    if (datagram_type.has_properties()) {
+      EXPECT_TRUE(writer.WriteStringPiece(kRawProperties));
     }
     if (datagram_type.has_status()) {
       EXPECT_TRUE(
@@ -339,7 +341,7 @@ class QUICHE_NO_EXPORT ObjectDatagramMessage : public ObjectMessage {
     if (!datagram_type_.has_default_priority()) {
       varints += "-";  // priority
     }
-    if (datagram_type_.has_extension()) {
+    if (datagram_type_.has_properties()) {
       varints += "v-------";
     }
     if (datagram_type_.has_status()) {
@@ -356,8 +358,8 @@ class QUICHE_NO_EXPORT ObjectDatagramMessage : public ObjectMessage {
   static constexpr absl::string_view kRawAliasGroup = "\x04\x05";
   static constexpr absl::string_view kRawObject = "\x06";
   static constexpr absl::string_view kRawPriority = "\x07";
-  static constexpr absl::string_view kRawExtensions{
-      "\x07\x00\x0c\x01\x03\x66\x6f\x6f", 8};  // see kDefaultExtensionBlob
+  static constexpr absl::string_view kRawProperties{
+      "\x07\x00\x0c\x01\x03\x66\x6f\x6f", 8};  // see kDefaultPropertyBlob
   static constexpr absl::string_view kRawPayload = "foo";
 };
 
@@ -373,8 +375,8 @@ class QUICHE_NO_EXPORT StreamHeaderSubgroupMessage : public ObjectMessage {
     } else if (type.SubgroupIsFirstObjectId()) {
       object_.subgroup_id = object_.object_id;
     }
-    if (!type.AreExtensionHeadersPresent()) {
-      object_.extension_headers = "";
+    if (!type.ArePropertiesPresent()) {
+      object_.properties = "";
     }
     // Build raw_packet_ from the type.
     quic::QuicDataWriter writer(sizeof(raw_packet_), raw_packet_);
@@ -390,9 +392,9 @@ class QUICHE_NO_EXPORT StreamHeaderSubgroupMessage : public ObjectMessage {
                                     kRawPublisherPriority.length()));
     }
     EXPECT_TRUE(writer.WriteBytes(kRawObjectId.data(), kRawObjectId.length()));
-    if (type.AreExtensionHeadersPresent()) {
+    if (type.ArePropertiesPresent()) {
       EXPECT_TRUE(
-          writer.WriteBytes(kRawExtensions.data(), kRawExtensions.length()));
+          writer.WriteBytes(kRawProperties.data(), kRawProperties.length()));
     }
     payload_length_offset_ = writer.length();
     EXPECT_TRUE(writer.WriteBytes(kRawPayload.data(), kRawPayload.length()));
@@ -409,7 +411,7 @@ class QUICHE_NO_EXPORT StreamHeaderSubgroupMessage : public ObjectMessage {
       varints += "-";  // priority
     }
     varints += "v";  // object ID
-    if (type_.AreExtensionHeadersPresent()) {
+    if (type_.ArePropertiesPresent()) {
       varints += "v-------";
     }
     varints += "v---";  // payload with length
@@ -442,8 +444,8 @@ class QUICHE_NO_EXPORT StreamHeaderSubgroupMessage : public ObjectMessage {
   static constexpr absl::string_view kRawSubgroupId = "\x08";
   static constexpr absl::string_view kRawPublisherPriority = "\x07";
   static constexpr absl::string_view kRawObjectId = "\x06";
-  static constexpr absl::string_view kRawExtensions{
-      "\x07\x00\x0c\x01\x03\x66\x6f\x6f", 8};  // see kDefaultExtensionBlob
+  static constexpr absl::string_view kRawProperties{
+      "\x07\x00\x0c\x01\x03\x66\x6f\x6f", 8};  // see kDefaultPropertyBlob
   static constexpr absl::string_view kRawPayload = "\x03\x66\x6f\x6f";
   char raw_packet_[18];
   size_t payload_length_offset_;
@@ -463,9 +465,9 @@ class QUICHE_NO_EXPORT StreamMiddlerSubgroupMessage : public ObjectMessage {
     object_.object_id = 9;
     quic::QuicDataWriter writer(sizeof(raw_packet_), raw_packet_);
     EXPECT_TRUE(writer.WriteMoqVarInt(2));  // Object ID delta - 1
-    if (type.AreExtensionHeadersPresent()) {
+    if (type.ArePropertiesPresent()) {
       EXPECT_TRUE(
-          writer.WriteBytes(kRawExtensions.data(), kRawExtensions.length()));
+          writer.WriteBytes(kRawProperties.data(), kRawProperties.length()));
     }
     EXPECT_TRUE(writer.WriteBytes(kRawPayload.data(), kRawPayload.length()));
     EXPECT_LE(writer.length(), kMaxMessageHeaderSize);
@@ -473,7 +475,7 @@ class QUICHE_NO_EXPORT StreamMiddlerSubgroupMessage : public ObjectMessage {
   }
 
   void ExpandVarints() override {
-    if (type_.AreExtensionHeadersPresent()) {
+    if (type_.ArePropertiesPresent()) {
       ExpandVarintsImpl("vv-------v---", false);
     } else {
       ExpandVarintsImpl("vv---", false);
@@ -482,8 +484,8 @@ class QUICHE_NO_EXPORT StreamMiddlerSubgroupMessage : public ObjectMessage {
 
  private:
   MoqtDataStreamType type_;
-  static constexpr absl::string_view kRawExtensions{
-      "\x07\x00\x0c\x01\x03\x66\x6f\x6f", 8};  // see kDefaultExtensionBlob
+  static constexpr absl::string_view kRawProperties{
+      "\x07\x00\x0c\x01\x03\x66\x6f\x6f", 8};  // see kDefaultPropertyBlob
   static constexpr absl::string_view kRawPayload = "\x03\x62\x61\x72";
   char raw_packet_[13];
 };
@@ -516,8 +518,8 @@ class QUICHE_NO_EXPORT StreamHeaderFetchMessage : public ObjectMessage {
       0x04,              // request ID
       0x3f,              // object serialization flag
       0x05, 0x08, 0x06,  // sequence
-      0x07, 0x07,        // publisher priority, 7B extensions
-      0x00, 0x0c, 0x01, 0x03, 0x66, 0x6f, 0x6f,  // extensions
+      0x07, 0x07,        // publisher priority, 7B properties
+      0x00, 0x0c, 0x01, 0x03, 0x66, 0x6f, 0x6f,  // properties
       0x03, 0x66, 0x6f, 0x6f,                    // payload = "foo"
   };
 };
@@ -530,7 +532,7 @@ class QUICHE_NO_EXPORT StreamMiddlerFetchMessage : public ObjectMessage {
     size_t length = 0;
     raw_packet_[length++] = static_cast<uint8_t>(serialization.value());
     if (serialization.has_group_id()) {
-      raw_packet_[length++] = 0x06;  // group ID
+      raw_packet_[length++] = 0x00;  // group ID delta = 0 (group ID = 6)
       object_.group_id = 6;
     }
     if (serialization.zero_subgroup_id()) {
@@ -549,7 +551,11 @@ class QUICHE_NO_EXPORT StreamMiddlerFetchMessage : public ObjectMessage {
       object_.subgroup_id = std::nullopt;
     }  // If prior_subgroup_id, subgroup_id is already set properly.
     if (serialization.has_object_id()) {
-      raw_packet_[length++] = 0x0a;
+      if (serialization.has_group_id()) {
+        raw_packet_[length++] = 0x0a;  // explicit object ID = 10
+      } else {
+        raw_packet_[length++] = 0x04;  // object ID delta = 4 (object ID = 10)
+      }
       object_.object_id = 10;
     } else {
       ++object_.object_id;
@@ -558,12 +564,12 @@ class QUICHE_NO_EXPORT StreamMiddlerFetchMessage : public ObjectMessage {
       raw_packet_[length++] = 0x09;
       object_.publisher_priority = MoqtPriority(0x09);
     }
-    if (serialization.has_extensions()) {
-      memcpy(&raw_packet_[length], kRawExtensions.data(),
-             kRawExtensions.length());
-      length += kRawExtensions.length();
+    if (serialization.has_properties()) {
+      memcpy(&raw_packet_[length], kRawProperties.data(),
+             kRawProperties.length());
+      length += kRawProperties.length();
     } else {
-      object_.extension_headers = "";
+      object_.properties = "";
     }
     memcpy(&raw_packet_[length], kRawPayload.data(), kRawPayload.length());
     length += kRawPayload.length();
@@ -585,7 +591,7 @@ class QUICHE_NO_EXPORT StreamMiddlerFetchMessage : public ObjectMessage {
     if (serialization_.has_priority()) {
       varints += "-";
     }
-    if (serialization_.has_extensions()) {
+    if (serialization_.has_properties()) {
       varints += "v-------";
     }
     varints += "v---";
@@ -595,28 +601,24 @@ class QUICHE_NO_EXPORT StreamMiddlerFetchMessage : public ObjectMessage {
  private:
   MoqtFetchSerialization serialization_;
   uint8_t raw_packet_[17];
-  static constexpr absl::string_view kRawExtensions{
-      "\x07\x00\x0c\x01\x03\x66\x6f\x6f", 8};  // see kDefaultExtensionBlob
+  static constexpr absl::string_view kRawProperties{
+      "\x07\x00\x0c\x01\x03\x66\x6f\x6f", 8};  // see kDefaultPropertyBlob
   static constexpr absl::string_view kRawPayload = "\x03\x62\x61\x72";
 };
 
 class QUICHE_NO_EXPORT ClientSetupMessage : public TestMessageBase {
  public:
   explicit ClientSetupMessage(bool webtrans) : TestMessageBase() {
-    client_setup_.parameters.moqt_implementation = kTestImplementationString;
+    client_setup_.options.moqt_implementation = kTestImplementationString;
     if (webtrans) {
       // Should not send PATH or AUTHORITY.
-      client_setup_.parameters.path = std::nullopt;
-      client_setup_.parameters.authority = std::nullopt;
-      raw_packet_[3] -= 17;   // adjust payload length
-      raw_packet_[4] = 0x02;  // only two parameters
-      // Move MaxRequestId up in the packet.
-      memmove(raw_packet_ + 5, raw_packet_ + 11, 2);
+      client_setup_.options.path = std::nullopt;
+      client_setup_.options.authority = std::nullopt;
+      raw_packet_[3] -= 17;  // adjust payload length
       // Move MoqtImplementation up in the packet.
-      memmove(raw_packet_ + 7, raw_packet_ + 24,
+      memmove(raw_packet_ + 4, raw_packet_ + 21,
               kTestImplementationString.length() + 2);
-      raw_packet_[5] = 0x02;  // Diff from 0.
-      raw_packet_[7] = 0x05;  // Diff from 2.
+      raw_packet_[4] = 0x07;  // Diff from 0.
       SetWireImage(raw_packet_, sizeof(raw_packet_) - 17);
     } else {
       SetWireImage(raw_packet_, sizeof(raw_packet_));
@@ -625,18 +627,18 @@ class QUICHE_NO_EXPORT ClientSetupMessage : public TestMessageBase {
 
   bool EqualFieldValues(const MessageStructuredData& values) const override {
     auto cast = std::get<MoqtSetup>(values);
-    if (cast.parameters != client_setup_.parameters) {
-      QUIC_LOG(INFO) << "CLIENT_SETUP parameter mismatch";
+    if (cast.options != client_setup_.options) {
+      QUIC_LOG(INFO) << "CLIENT_SETUP option mismatch";
       return false;
     }
     return true;
   }
 
   void ExpandVarints() override {
-    if (client_setup_.parameters.path.has_value()) {
-      ExpandVarintsImpl("vvv----vvvv---------vv---------------------------");
+    if (client_setup_.options.path.has_value()) {
+      ExpandVarintsImpl("vv----vv---------vv---------------------------");
     } else {
-      ExpandVarintsImpl("vvvvv---------------------------");
+      ExpandVarintsImpl("vv---------------------------");
     }
   }
 
@@ -645,59 +647,55 @@ class QUICHE_NO_EXPORT ClientSetupMessage : public TestMessageBase {
   }
 
  private:
-  // The framer serializes all the integer parameters in order, then all the
-  // string parameters in order. Unfortunately, this means that
+  // The framer serializes all the integer options in order, then all the
+  // string options in order. Unfortunately, this means that
   // kMoqtImplementation goes last even though it is always present, while
   // kPath and KAuthority aren't.
-  uint8_t raw_packet_[54] = {
-      0xaf, 0x00, 0x00, 0x32,              // type, length
-      0x04,                                // 4 parameters
+  uint8_t raw_packet_[51] = {
+      0xaf, 0x00, 0x00, 0x2f,              // type, length
       0x01, 0x04, 0x70, 0x61, 0x74, 0x68,  // path = "path"
-      0x01, 0x32,                          // max_request_id = 50
-      0x03, 0x09, 0x61, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69, 0x74,
+      0x04, 0x09, 0x61, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69, 0x74,
       0x79,  // authority = "authority"
       // moqt_implementation:
       0x02, 0x1c, 0x4d, 0x6f, 0x71, 0x20, 0x54, 0x65, 0x73, 0x74, 0x20, 0x49,
       0x6d, 0x70, 0x6c, 0x65, 0x6d, 0x65, 0x6e, 0x74, 0x61, 0x74, 0x69, 0x6f,
       0x6e, 0x20, 0x54, 0x79, 0x70, 0x65};
   MoqtSetup client_setup_ = {
-      SetupParameters("path", "authority", 50),
+      SetupOptions("path", "authority"),
   };
 };
 
 class QUICHE_NO_EXPORT ServerSetupMessage : public TestMessageBase {
  public:
   ServerSetupMessage() : TestMessageBase() {
-    server_setup_.parameters.moqt_implementation = kTestImplementationString;
+    server_setup_.options.moqt_implementation = kTestImplementationString;
     SetWireImage(raw_packet_, sizeof(raw_packet_));
   }
 
   bool EqualFieldValues(const MessageStructuredData& values) const override {
     auto cast = std::get<MoqtSetup>(values);
-    if (cast.parameters != server_setup_.parameters) {
-      QUIC_LOG(INFO) << "SERVER_SETUP parameter mismatch";
+    if (cast.options != server_setup_.options) {
+      QUIC_LOG(INFO) << "SERVER_SETUP option mismatch";
       return false;
     }
     return true;
   }
 
-  void ExpandVarints() override { ExpandVarintsImpl("vvv"); }
+  void ExpandVarints() override { ExpandVarintsImpl("vv"); }
 
   MessageStructuredData structured_data() const override {
     return TestMessageBase::MessageStructuredData(server_setup_);
   }
 
  private:
-  uint8_t raw_packet_[37] = {0xaf, 0x00, 0x00, 0x21,  // type, length
-                             0x02,                    // two parameters
-                             0x02, 0x32,              // max_subscribe_id = 50
-                             // moqt_implementation:
-                             0x05, 0x1c, 0x4d, 0x6f, 0x71, 0x20, 0x54, 0x65,
+  uint8_t raw_packet_[34] = {0xaf, 0x00, 0x00, 0x1e,  // type, length
+                                                      // moqt_implementation:
+                             0x07, 0x1c, 0x4d, 0x6f, 0x71, 0x20, 0x54, 0x65,
                              0x73, 0x74, 0x20, 0x49, 0x6d, 0x70, 0x6c, 0x65,
                              0x6d, 0x65, 0x6e, 0x74, 0x61, 0x74, 0x69, 0x6f,
                              0x6e, 0x20, 0x54, 0x79, 0x70, 0x65};
   MoqtSetup server_setup_ = {
-      SetupParameters(50),
+      SetupOptions(),
   };
 };
 
@@ -724,7 +722,7 @@ class QUICHE_NO_EXPORT SubscribeMessage : public TestMessageBase {
   }
 
   void ExpandVarints() override {
-    ExpandVarintsImpl("vvv---v----vv--vv-----vvvvvv---vv");
+    ExpandVarintsImpl("vvv---v----vv--vv-----vvv-v-vv---v-");
   }
 
   MessageStructuredData structured_data() const override {
@@ -739,14 +737,15 @@ class QUICHE_NO_EXPORT SubscribeMessage : public TestMessageBase {
   };
 
  private:
-  uint8_t raw_packet_[36] = {
-      0x03, 0x00, 0x21, 0x01,                    // request_id = 1
-      0x01, 0x03, 0x66, 0x6f, 0x6f,              // track_namespace = "foo"
-      0x04, 0x61, 0x62, 0x63, 0x64,              // track_name = "abcd"
-      0x06,                                      // 6 parameters
-      0x02, 0xa7, 0x10,                          // delivery_timeout = 10000 ms
+  uint8_t raw_packet_[38] = {
+      0x03, 0x00, 0x23, 0x01,        // request_id = 1
+      0x01, 0x03, 0x66, 0x6f, 0x6f,  // track_namespace = "foo"
+      0x04, 0x61, 0x62, 0x63, 0x64,  // track_name = "abcd"
+      0x07,                          // 7 parameters
+      0x02, 0xa7, 0x10,              // object_delivery_timeout = 10000 ms
       0x01, 0x05, 0x03, 0x00, 0x62, 0x61, 0x72,  // authorization_tag = "bar"
-      0x0d, 0x01,                                // forward = true
+      0x01, 0x64,                                // rendezvous_timeout = 100 ms
+      0x0c, 0x01,                                // forward = true
       0x10, 0x20,                                // subscriber_priority = 0x20
       0x01, 0x03, 0x03, 0x04, 0x01,  // filter_type = kAbsoluteStart (4, 1)
       0x01, 0x02,                    // group_order = kDescending
@@ -763,10 +762,6 @@ class QUICHE_NO_EXPORT SubscribeOkMessage : public TestMessageBase {
 
   bool EqualFieldValues(const MessageStructuredData& values) const override {
     auto cast = std::get<MoqtSubscribeOk>(values);
-    if (cast.request_id != subscribe_ok_.request_id) {
-      QUIC_LOG(INFO) << "SUBSCRIBE OK subscribe ID mismatch";
-      return false;
-    }
     if (cast.track_alias != subscribe_ok_.track_alias) {
       QUIC_LOG(INFO) << "SUBSCRIBE OK track alias mismatch";
       return false;
@@ -775,46 +770,47 @@ class QUICHE_NO_EXPORT SubscribeOkMessage : public TestMessageBase {
       QUIC_LOG(INFO) << "SUBSCRIBE OK parameter mismatch";
       return false;
     }
-    if (cast.extensions != subscribe_ok_.extensions) {
-      QUIC_LOG(INFO) << "SUBSCRIBE OK extensions mismatch";
+    if (cast.properties != subscribe_ok_.properties) {
+      QUIC_LOG(INFO) << "SUBSCRIBE OK properties mismatch";
       return false;
     }
     return true;
   }
 
-  void ExpandVarints() override { ExpandVarintsImpl("vvvvvvv--v--v--vv"); }
+  void ExpandVarints() override { ExpandVarintsImpl("vvvvvvvv--v--vv"); }
 
   MessageStructuredData structured_data() const override {
     return TestMessageBase::MessageStructuredData(subscribe_ok_);
   }
 
   void SetInvalidDeliveryOrder() {
-    raw_packet_[19] = 0x10;
+    raw_packet_[17] = 0x10;
     SetWireImage(raw_packet_, sizeof(raw_packet_));
   }
 
  protected:
   // This is protected so that TrackStatusOk can edit the fields.
   MoqtSubscribeOk subscribe_ok_ = {
-      /*request_id=*/1,
       /*track_alias=*/2,
       MessageParameters(),  // Set in the constructor.
-      TrackExtensions(
-          /*delivery_timeout=*/quic::QuicTimeDelta::FromMilliseconds(10000),
+      TrackProperties(
+          /*object_delivery_timeout=*/
+          quic::QuicTimeDelta::FromMilliseconds(10000),
           /*max_cache_duration=*/quic::QuicTimeDelta::FromMilliseconds(10000),
+          /*subgroup_delivery_timeout=*/std::nullopt,
           /*publisher_priority=*/std::nullopt,
-          /*group_order=*/MoqtDeliveryOrder::kDescending,
+          /*group_order=*/MoqtGroupOrder::kDescending,
           /*dynamic_groups=*/std::nullopt,
-          /*immutable_extensions=*/std::nullopt),
+          /*immutable_properties=*/std::nullopt),
   };
 
  private:
-  uint8_t raw_packet_[20] = {
-      0x04, 0x00, 0x11, 0x01, 0x02, 0x02,  // request_id, alias, 2 params
-      0x08, 0x03,                          // expires = 3
-      0x01, 0x02, 0x0c, 0x14,              // largest_location = (12, 20)
-      // Extensions
-      0x02, 0xa7, 0x10,  // delivery_timeout = 10000
+  uint8_t raw_packet_[18] = {
+      0x04, 0x00, 0x0f, 0x02, 0x02,  // alias, 2 params
+      0x08, 0x03,                    // expires = 3
+      0x01, 0x0c, 0x14,              // largest_location = (12, 20)
+      // Properties
+      0x02, 0xa7, 0x10,  // object_delivery_timeout = 10000
       0x02, 0xa7, 0x10,  // max_cache_duration = 10000
       0x1e, 0x02         // default_publisher_group_order = 2
   };
@@ -828,10 +824,6 @@ class QUICHE_NO_EXPORT RequestErrorMessage : public TestMessageBase {
 
   bool EqualFieldValues(const MessageStructuredData& values) const override {
     auto cast = std::get<MoqtRequestError>(values);
-    if (cast.request_id != request_error_.request_id) {
-      QUIC_LOG(INFO) << "REQUEST_ERROR request_id mismatch";
-      return false;
-    }
     if (cast.error_code != request_error_.error_code) {
       QUIC_LOG(INFO) << "REQUEST_ERROR error code mismatch";
       return false;
@@ -844,10 +836,14 @@ class QUICHE_NO_EXPORT RequestErrorMessage : public TestMessageBase {
       QUIC_LOG(INFO) << "REQUEST_ERROR reason phrase mismatch";
       return false;
     }
+    if (cast.redirect != request_error_.redirect) {
+      QUIC_LOG(INFO) << "REQUEST_ERROR redirect mismatch";
+      return false;
+    }
     return true;
   }
 
-  void ExpandVarints() override { ExpandVarintsImpl("vvv---"); }
+  void ExpandVarints() override { ExpandVarintsImpl("vv---"); }
 
   MessageStructuredData structured_data() const override {
     return TestMessageBase::MessageStructuredData(request_error_);
@@ -855,16 +851,14 @@ class QUICHE_NO_EXPORT RequestErrorMessage : public TestMessageBase {
 
  protected:
   MoqtRequestError request_error_ = {
-      /*request_id=*/2,
       /*error_code=*/RequestErrorCode::kInvalidRange,
       /*retry_interval=*/quic::QuicTimeDelta::FromSeconds(10),
       /*reason_phrase=*/"bar",
   };
 
  private:
-  uint8_t raw_packet_[11] = {
-      0x05, 0x00, 0x08,
-      0x02,                    // request_id = 2
+  uint8_t raw_packet_[10] = {
+      0x05, 0x00, 0x07,
       0x11,                    // error_code = 17
       0xa7, 0x11,              // retry_interval = 10000 ms
       0x03, 0x62, 0x61, 0x72,  // reason_phrase = "bar"
@@ -880,10 +874,6 @@ class QUICHE_NO_EXPORT PublishDoneMessage : public TestMessageBase {
 
   bool EqualFieldValues(const MessageStructuredData& values) const override {
     auto cast = std::get<MoqtPublishDone>(values);
-    if (cast.request_id != publish_done_.request_id) {
-      QUIC_LOG(INFO) << "PUBLISH_DONE request ID mismatch";
-      return false;
-    }
     if (cast.status_code != publish_done_.status_code) {
       QUIC_LOG(INFO) << "PUBLISH_DONE status code mismatch";
       return false;
@@ -900,22 +890,21 @@ class QUICHE_NO_EXPORT PublishDoneMessage : public TestMessageBase {
     return true;
   }
 
-  void ExpandVarints() override { ExpandVarintsImpl("vvvv--"); }
+  void ExpandVarints() override { ExpandVarintsImpl("vvv--"); }
 
   MessageStructuredData structured_data() const override {
     return TestMessageBase::MessageStructuredData(publish_done_);
   }
 
  private:
-  uint8_t raw_packet_[9] = {
-      0x0b, 0x00, 0x06, 0x02, 0x02,  // request_id = 2, error_code = 2,
-      0x05,                          // stream_count = 5
-      0x02, 0x68, 0x69,              // error_reason = "hi"
+  uint8_t raw_packet_[8] = {
+      0x0b, 0x00, 0x05, 0x02,  // status_code = 2
+      0x05,                    // stream_count = 5
+      0x02, 0x68, 0x69,        // error_reason = "hi"
   };
 
   MoqtPublishDone publish_done_ = {
-      /*request_id=*/2,
-      /*error_code=*/PublishDoneCode::kTrackEnded,
+      /*status_code=*/PublishDoneCode::kTrackEnded,
       /*stream_count=*/5,
       /*error_reason=*/"hi",
   };
@@ -925,21 +914,18 @@ class QUICHE_NO_EXPORT RequestUpdateMessage : public TestMessageBase {
  public:
   RequestUpdateMessage() : TestMessageBase() {
     SetWireImage(raw_packet_, sizeof(raw_packet_));
-    request_update_.parameters.delivery_timeout =
+    request_update_.parameters.object_delivery_timeout =
         quic::QuicTimeDelta::FromMilliseconds(10000);
     request_update_.parameters.set_forward(true);
     request_update_.parameters.subscriber_priority = 0xaa;
     request_update_.parameters.subscription_filter.emplace(Location(3, 1), 5);
+    request_update_.parameters.track_namespace_prefix = TrackNamespace({"bar"});
   }
 
   bool EqualFieldValues(const MessageStructuredData& values) const override {
     auto cast = std::get<MoqtRequestUpdate>(values);
     if (cast.request_id != request_update_.request_id) {
       QUIC_LOG(INFO) << "REQUEST_UPDATE request ID mismatch";
-      return false;
-    }
-    if (cast.existing_request_id != request_update_.existing_request_id) {
-      QUIC_LOG(INFO) << "REQUEST_UPDATE existing request ID mismatch";
       return false;
     }
     if (cast.parameters != request_update_.parameters) {
@@ -949,25 +935,25 @@ class QUICHE_NO_EXPORT RequestUpdateMessage : public TestMessageBase {
     return true;
   }
 
-  void ExpandVarints() override { ExpandVarintsImpl("vvvv--vvv--vv----"); }
+  void ExpandVarints() override { ExpandVarintsImpl("vvv--v-v-vv----vvv---"); }
 
   MessageStructuredData structured_data() const override {
     return TestMessageBase::MessageStructuredData(request_update_);
   }
 
  private:
-  uint8_t raw_packet_[20] = {
-      0x02, 0x00, 0x11, 0x02, 0x00,        // request IDs 2 and 0
-      0x04,                                // Four parameters
-      0x02, 0xa7, 0x10,                    // delivery_timeout = 10000
+  uint8_t raw_packet_[24] = {
+      0x02, 0x00, 0x15, 0x02,              // request_id = 2
+      0x05,                                // Five parameters
+      0x02, 0xa7, 0x10,                    // object_delivery_timeout = 10000
       0x0e, 0x01,                          // forward = true
-      0x10, 0x80, 0xaa,                    // subscriber_priority = 0xaa
+      0x10, 0xaa,                          // subscriber_priority = 0xaa
       0x01, 0x04, 0x04, 0x03, 0x01, 0x02,  // Absolute Range: (3, 1) to 5
+      0x13, 0x01, 0x03, 0x62, 0x61, 0x72,  // prefix = "bar"
   };
 
   MoqtRequestUpdate request_update_ = {
       /*request_id=*/2,
-      /*existing_request_id=*/0,
       MessageParameters(),  // Set in the constructor.
   };
 };
@@ -1082,6 +1068,39 @@ class QUICHE_NO_EXPORT NamespaceDoneMessage : public TestMessageBase {
   };
 };
 
+class QUICHE_NO_EXPORT PublishSkippedMessage : public TestMessageBase {
+ public:
+  PublishSkippedMessage() : TestMessageBase() {
+    SetWireImage(raw_packet_, sizeof(raw_packet_));
+  }
+
+  bool EqualFieldValues(const MessageStructuredData& values) const override {
+    auto cast = std::get<MoqtPublishSkipped>(values);
+    if (cast.name != publish_skipped_.name) {
+      QUIC_LOG(INFO) << "PUBLISH_SKIPPED name mismatch";
+      return false;
+    }
+    return true;
+  }
+
+  void ExpandVarints() override { ExpandVarintsImpl("vv---v---"); }
+
+  MessageStructuredData structured_data() const override {
+    return TestMessageBase::MessageStructuredData(publish_skipped_);
+  }
+
+ private:
+  uint8_t raw_packet_[12] = {
+      0x0f, 0x00, 0x09, 0x01,
+      0x03, 0x66, 0x6f, 0x6f,  // track_namespace = "foo"
+      0x03, 0x62, 0x61, 0x72,  // track_name = "bar"
+  };
+
+  MoqtPublishSkipped publish_skipped_ = {
+      FullTrackName("foo", "bar"),
+  };
+};
+
 class QUICHE_NO_EXPORT RequestOkMessage : public TestMessageBase {
  public:
   RequestOkMessage() : TestMessageBase() {
@@ -1091,53 +1110,94 @@ class QUICHE_NO_EXPORT RequestOkMessage : public TestMessageBase {
 
   bool EqualFieldValues(const MessageStructuredData& values) const override {
     auto cast = std::get<MoqtRequestOk>(values);
-    if (cast.request_id != request_ok_.request_id) {
-      QUIC_LOG(INFO) << "REQUEST_OK request ID mismatch";
-      return false;
-    }
     if (cast.parameters != request_ok_.parameters) {
       QUIC_LOG(INFO) << "REQUEST_OK parameter mismatch";
+      return false;
+    }
+    if (cast.properties != request_ok_.properties) {
+      QUIC_LOG(INFO) << "REQUEST_OK properties mismatch";
       return false;
     }
     return true;
   }
 
-  void ExpandVarints() override { ExpandVarintsImpl("vvvv--"); }
+  void ExpandVarints() override { ExpandVarintsImpl("vvvvv--v--v-"); }
 
   MessageStructuredData structured_data() const override {
     return TestMessageBase::MessageStructuredData(request_ok_);
   }
 
  private:
-  uint8_t raw_packet_[9] = {
-      0x07, 0x00, 0x06, 0x01,  // request_id = 1
-      0x01,                    // 1 parameter
-      0x09, 0x02, 0x05, 0x01,  // Largest Object = (5, 1)
+  uint8_t raw_packet_[15] = {
+      0x07, 0x00, 0x0c,
+      0x01,              // 1 parameter
+      0x09, 0x05, 0x01,  // Largest Object = (5, 1)
+      // Properties
+      0x02, 0xa7, 0x10,  // object_delivery_timeout = 10000
+      0x02, 0xa7, 0x10,  // max_cache_duration = 10000
+      0x1e, 0x02         // default_publisher_group_order = 2
   };
 
   MoqtRequestOk request_ok_ = {
-      /*request_id=*/1,
       MessageParameters(),  // Set in the constructor.
+      TrackProperties(
+          /*object_delivery_timeout=*/
+          quic::QuicTimeDelta::FromMilliseconds(10000),
+          /*max_cache_duration=*/quic::QuicTimeDelta::FromMilliseconds(10000),
+          /*subgroup_delivery_timeout=*/std::nullopt,
+          /*publisher_priority=*/std::nullopt,
+          /*group_order=*/MoqtGroupOrder::kDescending,
+          /*dynamic_groups=*/std::nullopt,
+          /*immutable_properties=*/std::nullopt),
   };
 };
 
-class QUICHE_NO_EXPORT TrackStatusMessage : public SubscribeMessage {
+class QUICHE_NO_EXPORT TrackStatusMessage : public TestMessageBase {
  public:
-  TrackStatusMessage() : SubscribeMessage() {
-    SetByte(0, static_cast<uint8_t>(MoqtMessageType::kTrackStatus));
+  TrackStatusMessage() : TestMessageBase() {
+    SetWireImage(raw_packet_, sizeof(raw_packet_));
+    track_status_.parameters = MessageParameters();
+    track_status_.parameters.authorization_tokens.emplace_back(
+        AuthTokenType::kOutOfBand, "bar");
   }
 
   bool EqualFieldValues(const MessageStructuredData& values) const override {
-    auto value = std::get<MoqtTrackStatus>(values);
-    auto* subscribe = reinterpret_cast<MoqtSubscribe*>(&value);
-    MessageStructuredData structured_data =
-        TestMessageBase::MessageStructuredData(*subscribe);
-    return SubscribeMessage::EqualFieldValues(structured_data);
+    auto cast = std::get<MoqtTrackStatus>(values);
+    if (cast.request_id != track_status_.request_id) {
+      QUIC_LOG(INFO) << "TRACK_STATUS request_id mismatch";
+      return false;
+    }
+    if (cast.full_track_name != track_status_.full_track_name) {
+      QUIC_LOG(INFO) << "TRACK_STATUS full_track_name mismatch";
+      return false;
+    }
+    if (cast.parameters != track_status_.parameters) {
+      QUIC_LOG(INFO) << "TRACK_STATUS parameters mismatch";
+      return false;
+    }
+    return true;
   }
 
+  void ExpandVarints() override { ExpandVarintsImpl("vvv---v----vvv-----"); }
+
   MessageStructuredData structured_data() const override {
-    return TestMessageBase::MessageStructuredData(MoqtTrackStatus(subscribe_));
+    return TestMessageBase::MessageStructuredData(track_status_);
   }
+
+ private:
+  MoqtTrackStatus track_status_ = {
+      /*request_id=*/1,
+      FullTrackName("foo", "abcd"),
+      MessageParameters(),  // Set in the constructor.
+  };
+
+  uint8_t raw_packet_[22] = {
+      0x0d, 0x00, 0x13, 0x01,                    // request_id = 1
+      0x01, 0x03, 0x66, 0x6f, 0x6f,              // track_namespace = "foo"
+      0x04, 0x61, 0x62, 0x63, 0x64,              // track_name = "abcd"
+      0x01,                                      // 1 parameter
+      0x03, 0x05, 0x03, 0x00, 0x62, 0x61, 0x72,  // authorization_tag = "bar"
+  };
 };
 
 class QUICHE_NO_EXPORT GoAwayMessage : public TestMessageBase {
@@ -1149,25 +1209,41 @@ class QUICHE_NO_EXPORT GoAwayMessage : public TestMessageBase {
   bool EqualFieldValues(const MessageStructuredData& values) const override {
     auto cast = std::get<MoqtGoAway>(values);
     if (cast.new_session_uri != goaway_.new_session_uri) {
-      QUIC_LOG(INFO) << "GOAWAY full track name mismatch";
+      QUIC_LOG(INFO) << "GOAWAY new session URI mismatch";
+      return false;
+    }
+    if (cast.timeout != goaway_.timeout) {
+      QUIC_LOG(INFO) << "GOAWAY timeout mismatch";
+      return false;
+    }
+    if (cast.request_id != goaway_.request_id) {
+      QUIC_LOG(INFO) << "GOAWAY request ID mismatch";
       return false;
     }
     return true;
   }
 
-  void ExpandVarints() override { ExpandVarintsImpl("v---"); }
+  void RequestStreamMessage() {  // Remove the request ID.
+    raw_packet_[2] = 0x05;
+    SetWireImage(raw_packet_, sizeof(raw_packet_) - 1);
+    goaway_.request_id = std::nullopt;
+  }
+
+  void ExpandVarints() override { ExpandVarintsImpl("v---vv"); }
 
   MessageStructuredData structured_data() const override {
     return TestMessageBase::MessageStructuredData(goaway_);
   }
 
  private:
-  uint8_t raw_packet_[7] = {
-      0x10, 0x00, 0x04, 0x03, 0x66, 0x6f, 0x6f,
+  uint8_t raw_packet_[9] = {
+      0x10, 0x00, 0x06, 0x03, 0x66, 0x6f, 0x6f, 0x03, 0x40,
   };
 
   MoqtGoAway goaway_ = {
       /*new_session_uri=*/"foo",
+      /*timeout=*/quic::QuicTimeDelta::FromMilliseconds(3),
+      /*request_id=*/64,
   };
 };
 
@@ -1176,7 +1252,6 @@ class QUICHE_NO_EXPORT SubscribeNamespaceMessage : public TestMessageBase {
   SubscribeNamespaceMessage() : TestMessageBase() {
     subscribe_namespace_.parameters.authorization_tokens.push_back(
         AuthToken(AuthTokenType::kOutOfBand, "bar"));
-    subscribe_namespace_.parameters.set_forward(true);
     SetWireImage(raw_packet_, sizeof(raw_packet_));
   }
 
@@ -1198,19 +1273,18 @@ class QUICHE_NO_EXPORT SubscribeNamespaceMessage : public TestMessageBase {
     return true;
   }
 
-  void ExpandVarints() override { ExpandVarintsImpl("vvv---vvv-----vv"); }
+  void ExpandVarints() override { ExpandVarintsImpl("vvv---vvv-----"); }
 
   MessageStructuredData structured_data() const override {
     return TestMessageBase::MessageStructuredData(subscribe_namespace_);
   }
 
  private:
-  uint8_t raw_packet_[19] = {
-      0x50, 0x00, 0x10, 0x01,                    // request_id = 1
+  uint8_t raw_packet_[17] = {
+      0x50, 0x00, 0x0e, 0x01,                    // request_id = 1
       0x01, 0x03, 0x66, 0x6f, 0x6f,              // namespace = "foo"
-      0x02,                                      // 2 parameters
+      0x01,                                      // 1 parameter
       0x03, 0x05, 0x03, 0x00, 0x62, 0x61, 0x72,  // authorization_tag = "bar"
-      0x0d, 0x01,                                // forward = true
   };
 
   MoqtSubscribeNamespace subscribe_namespace_ = {
@@ -1247,7 +1321,7 @@ class QUICHE_NO_EXPORT SubscribeTracksMessage : public TestMessageBase {
     return true;
   }
 
-  void ExpandVarints() override { ExpandVarintsImpl("vvv---vvv-----vv"); }
+  void ExpandVarints() override { ExpandVarintsImpl("vvv---vvv-----v-"); }
 
   MessageStructuredData structured_data() const override {
     return TestMessageBase::MessageStructuredData(subscribe_tracks_);
@@ -1269,47 +1343,14 @@ class QUICHE_NO_EXPORT SubscribeTracksMessage : public TestMessageBase {
   };
 };
 
-class QUICHE_NO_EXPORT MaxRequestIdMessage : public TestMessageBase {
- public:
-  MaxRequestIdMessage() : TestMessageBase() {
-    SetWireImage(raw_packet_, sizeof(raw_packet_));
-  }
-
-  bool EqualFieldValues(const MessageStructuredData& values) const override {
-    auto cast = std::get<MoqtMaxRequestId>(values);
-    if (cast.max_request_id != max_request_id_.max_request_id) {
-      QUIC_LOG(INFO) << "MAX_REQUEST_ID mismatch";
-      return false;
-    }
-    return true;
-  }
-
-  void ExpandVarints() override { ExpandVarintsImpl("v"); }
-
-  MessageStructuredData structured_data() const override {
-    return TestMessageBase::MessageStructuredData(max_request_id_);
-  }
-
- private:
-  uint8_t raw_packet_[4] = {
-      0x15,
-      0x00,
-      0x01,
-      0x0b,
-  };
-
-  MoqtMaxRequestId max_request_id_ = {
-      /*max_request_id =*/11,
-  };
-};
-
 class QUICHE_NO_EXPORT FetchMessage : public TestMessageBase {
  public:
   FetchMessage() : TestMessageBase() {
     SetWireImage(raw_packet_, sizeof(raw_packet_));
     fetch_.parameters.authorization_tokens.push_back(
         AuthToken(AuthTokenType::kOutOfBand, "baz"));
-    fetch_.parameters.group_order = MoqtDeliveryOrder::kAscending;
+    fetch_.parameters.group_order = MoqtGroupOrder::kAscending;
+    fetch_.parameters.fill_timeout = quic::QuicTimeDelta::FromMilliseconds(100);
     fetch_.parameters.subscriber_priority = 2;
   }
   bool EqualFieldValues(const MessageStructuredData& values) const override {
@@ -1330,7 +1371,7 @@ class QUICHE_NO_EXPORT FetchMessage : public TestMessageBase {
   }
 
   void ExpandVarints() override {
-    ExpandVarintsImpl("vvvv---v---vvvvvvv-----vvvv");
+    ExpandVarintsImpl("vvvv---v---vvvvvvv-----vvv-v-");
   }
 
   MessageStructuredData structured_data() const override {
@@ -1355,17 +1396,18 @@ class QUICHE_NO_EXPORT FetchMessage : public TestMessageBase {
   }
 
  private:
-  uint8_t raw_packet_[30] = {
-      0x16, 0x00, 0x1b,
+  uint8_t raw_packet_[32] = {
+      0x16, 0x00, 0x1d,
       0x01,                                      // request_id = 1
       0x01,                                      // type = kStandalone
       0x01, 0x03, 0x66, 0x6f, 0x6f,              // track_namespace = "foo"
       0x03, 0x62, 0x61, 0x72,                    // track_name = "bar"
       0x01, 0x02,                                // start_location = 1, 2
       0x05, 0x07,                                // end_location = 5, 6
-      0x03,                                      // 3 parameters
+      0x04,                                      // 3 parameters
       0x03, 0x05, 0x03, 0x00, 0x62, 0x61, 0x7a,  // token = "baz"
-      0x1d, 0x02,                                // priority = kHigh
+      0x07, 0x64,                                // fill_timeout = 100ms
+      0x16, 0x02,                                // priority = kHigh
       0x02, 0x01,                                // group_order = kAscending
   };
 
@@ -1388,7 +1430,7 @@ class QUICHE_NO_EXPORT RelativeJoiningFetchMessage : public TestMessageBase {
     SetWireImage(raw_packet_, sizeof(raw_packet_));
     fetch_.parameters.authorization_tokens.push_back(
         AuthToken(AuthTokenType::kOutOfBand, "baz"));
-    fetch_.parameters.group_order = MoqtDeliveryOrder::kAscending;
+    fetch_.parameters.group_order = MoqtGroupOrder::kAscending;
     fetch_.parameters.subscriber_priority = 2;
   }
   bool EqualFieldValues(const MessageStructuredData& values) const override {
@@ -1408,7 +1450,7 @@ class QUICHE_NO_EXPORT RelativeJoiningFetchMessage : public TestMessageBase {
     return true;
   }
 
-  void ExpandVarints() override { ExpandVarintsImpl("vvvvvvv-----vvvv"); }
+  void ExpandVarints() override { ExpandVarintsImpl("vvvvvvv-----v-v-"); }
 
   MessageStructuredData structured_data() const override {
     return TestMessageBase::MessageStructuredData(fetch_);
@@ -1446,7 +1488,7 @@ class QUICHE_NO_EXPORT AbsoluteJoiningFetchMessage : public TestMessageBase {
     SetWireImage(raw_packet_, sizeof(raw_packet_));
     fetch_.parameters.authorization_tokens.push_back(
         AuthToken(AuthTokenType::kOutOfBand, "baz"));
-    fetch_.parameters.group_order = MoqtDeliveryOrder::kAscending;
+    fetch_.parameters.group_order = MoqtGroupOrder::kAscending;
     fetch_.parameters.subscriber_priority = 2;
   }
   bool EqualFieldValues(const MessageStructuredData& values) const override {
@@ -1466,7 +1508,7 @@ class QUICHE_NO_EXPORT AbsoluteJoiningFetchMessage : public TestMessageBase {
     return true;
   }
 
-  void ExpandVarints() override { ExpandVarintsImpl("vvvvvvv-----vvvv"); }
+  void ExpandVarints() override { ExpandVarintsImpl("vvvvvvv-----v-v-"); }
 
   MessageStructuredData structured_data() const override {
     return TestMessageBase::MessageStructuredData(fetch_);
@@ -1503,10 +1545,6 @@ class QUICHE_NO_EXPORT FetchOkMessage : public TestMessageBase {
   }
   bool EqualFieldValues(const MessageStructuredData& values) const override {
     auto cast = std::get<MoqtFetchOk>(values);
-    if (cast.request_id != fetch_ok_.request_id) {
-      QUIC_LOG(INFO) << "FETCH_OK request_id mismatch";
-      return false;
-    }
     if (cast.end_of_track != fetch_ok_.end_of_track) {
       QUIC_LOG(INFO) << "FETCH_OK end_of_track mismatch";
       return false;
@@ -1519,23 +1557,22 @@ class QUICHE_NO_EXPORT FetchOkMessage : public TestMessageBase {
       QUIC_LOG(INFO) << "FETCH_OK parameters mismatch";
       return false;
     }
-    if (cast.extensions != fetch_ok_.extensions) {
-      QUIC_LOG(INFO) << "FETCH_OK extensions mismatch";
+    if (cast.properties != fetch_ok_.properties) {
+      QUIC_LOG(INFO) << "FETCH_OK properties mismatch";
       return false;
     }
     return true;
   }
 
-  void ExpandVarints() override { ExpandVarintsImpl("v-vvvv--vv"); }
+  void ExpandVarints() override { ExpandVarintsImpl("-vvvv--vv"); }
 
   MessageStructuredData structured_data() const override {
     return TestMessageBase::MessageStructuredData(fetch_ok_);
   }
 
  private:
-  uint8_t raw_packet_[13] = {
-      0x18, 0x00, 0x0a,
-      0x01,              // request_id = 1
+  uint8_t raw_packet_[12] = {
+      0x18, 0x00, 0x09,
       0x00,              // end_of_track = false
       0x05, 0x04,        // end_location = 5, 3
       0x00,              // no parameters
@@ -1544,80 +1581,13 @@ class QUICHE_NO_EXPORT FetchOkMessage : public TestMessageBase {
   };
 
   MoqtFetchOk fetch_ok_ = {
-      /*request_id =*/1,
       /*end_of_track=*/false,
       /*end_location=*/Location{5, 3},
       MessageParameters(),
-      TrackExtensions(std::nullopt,
+      TrackProperties(std::nullopt,
                       quic::QuicTimeDelta::FromMilliseconds(10000),
-                      std::nullopt, MoqtDeliveryOrder::kDescending,
+                      std::nullopt, std::nullopt, MoqtGroupOrder::kDescending,
                       std::nullopt, std::nullopt),
-  };
-};
-
-class QUICHE_NO_EXPORT FetchCancelMessage : public TestMessageBase {
- public:
-  FetchCancelMessage() : TestMessageBase() {
-    SetWireImage(raw_packet_, sizeof(raw_packet_));
-  }
-  bool EqualFieldValues(const MessageStructuredData& values) const override {
-    auto cast = std::get<MoqtFetchCancel>(values);
-    if (cast.request_id != fetch_cancel_.request_id) {
-      QUIC_LOG(INFO) << "FETCH_CANCEL subscribe_id mismatch";
-      return false;
-    }
-    return true;
-  }
-
-  void ExpandVarints() override { ExpandVarintsImpl("v"); }
-
-  MessageStructuredData structured_data() const override {
-    return TestMessageBase::MessageStructuredData(fetch_cancel_);
-  }
-
- private:
-  uint8_t raw_packet_[4] = {
-      0x17,
-      0x00,
-      0x01,
-      0x01,  // request_id = 1
-  };
-
-  MoqtFetchCancel fetch_cancel_ = {
-      /*request_id =*/1,
-  };
-};
-
-class QUICHE_NO_EXPORT RequestsBlockedMessage : public TestMessageBase {
- public:
-  RequestsBlockedMessage() : TestMessageBase() {
-    SetWireImage(raw_packet_, sizeof(raw_packet_));
-  }
-  bool EqualFieldValues(const MessageStructuredData& values) const override {
-    auto cast = std::get<MoqtRequestsBlocked>(values);
-    if (cast.max_request_id != requests_blocked_.max_request_id) {
-      QUIC_LOG(INFO) << "SUBSCRIBES_BLOCKED max_subscribe_id mismatch";
-      return false;
-    }
-    return true;
-  }
-
-  void ExpandVarints() override { ExpandVarintsImpl("v"); }
-
-  MessageStructuredData structured_data() const override {
-    return TestMessageBase::MessageStructuredData(requests_blocked_);
-  }
-
- private:
-  uint8_t raw_packet_[4] = {
-      0x1a,
-      0x00,
-      0x01,
-      0x0b,  // max_request_id = 11
-  };
-
-  MoqtRequestsBlocked requests_blocked_ = {
-      /*max_request_id=*/11,
   };
 };
 
@@ -1648,15 +1618,15 @@ class QUICHE_NO_EXPORT PublishMessage : public TestMessageBase {
       QUIC_LOG(INFO) << "PUBLISH parameters mismatch";
       return false;
     }
-    if (cast.extensions != publish_.extensions) {
-      QUIC_LOG(INFO) << "PUBLISH extensions mismatch";
+    if (cast.properties != publish_.properties) {
+      QUIC_LOG(INFO) << "PUBLISH properties mismatch";
       return false;
     }
     return true;
   }
 
   void ExpandVarints() override {
-    ExpandVarintsImpl("vvv---v---vvvv-----vv--vvvv");
+    ExpandVarintsImpl("vvv---v---vvvv-----vvvv-v-");
   }
 
   MessageStructuredData structured_data() const override {
@@ -1664,15 +1634,15 @@ class QUICHE_NO_EXPORT PublishMessage : public TestMessageBase {
   }
 
  private:
-  uint8_t raw_packet_[30] = {
-      0x1d, 0x00, 0x1b,
+  uint8_t raw_packet_[29] = {
+      0x1d, 0x00, 0x1a,
       0x01,                                      // request_id = 1
       0x01, 0x03, 0x66, 0x6f, 0x6f,              // track_namespace = "foo"
       0x03, 0x62, 0x61, 0x72,                    // track_name = "bar"
       0x04,                                      // track_alias = 4
       0x03,                                      // 3 parameters
       0x03, 0x05, 0x03, 0x00, 0x62, 0x61, 0x7a,  // token = "baz"
-      0x06, 0x02, 0x0a, 0x01,                    // largest_object = 10, 1
+      0x06, 0x0a, 0x01,                          // largest_object = 10, 1
       0x07, 0x01,                                // forward = 1
       0x22, 0x02,                                // group_order = kAscending
   };
@@ -1682,9 +1652,8 @@ class QUICHE_NO_EXPORT PublishMessage : public TestMessageBase {
       FullTrackName("foo", "bar"),
       /*track_alias=*/4,
       MessageParameters(),
-      TrackExtensions(std::nullopt, std::nullopt, std::nullopt,
-                      MoqtDeliveryOrder::kDescending, std::nullopt,
-                      std::nullopt),
+      TrackProperties(std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                      MoqtGroupOrder::kDescending, std::nullopt, std::nullopt),
   };
 };
 
@@ -1754,6 +1723,8 @@ static inline std::unique_ptr<TestMessageBase> CreateTestMessage(
       return std::make_unique<NamespaceMessage>();
     case MoqtMessageType::kNamespaceDone:
       return std::make_unique<NamespaceDoneMessage>();
+    case MoqtMessageType::kPublishSkipped:
+      return std::make_unique<PublishSkippedMessage>();
     case MoqtMessageType::kTrackStatus:
       return std::make_unique<TrackStatusMessage>();
     case MoqtMessageType::kGoAway:
@@ -1762,16 +1733,10 @@ static inline std::unique_ptr<TestMessageBase> CreateTestMessage(
       return std::make_unique<SubscribeNamespaceMessage>();
     case MoqtMessageType::kSubscribeTracks:
       return std::make_unique<SubscribeTracksMessage>();
-    case MoqtMessageType::kMaxRequestId:
-      return std::make_unique<MaxRequestIdMessage>();
     case MoqtMessageType::kFetch:
       return std::make_unique<FetchMessage>();
-    case MoqtMessageType::kFetchCancel:
-      return std::make_unique<FetchCancelMessage>();
     case MoqtMessageType::kFetchOk:
       return std::make_unique<FetchOkMessage>();
-    case MoqtMessageType::kRequestsBlocked:
-      return std::make_unique<RequestsBlockedMessage>();
     case MoqtMessageType::kPublish:
       return std::make_unique<PublishMessage>();
     case MoqtMessageType::kObjectAck:
@@ -1789,9 +1754,6 @@ static inline std::unique_ptr<TestMessageBase> CreateTestMessage(
 
 static inline std::unique_ptr<TestMessageBase> CreateTestDataStream(
     MoqtDataStreamType type) {
-  if (type.IsPadding()) {
-    return nullptr;
-  }
   if (type.IsFetch()) {
     return std::make_unique<StreamHeaderFetchMessage>();
   }

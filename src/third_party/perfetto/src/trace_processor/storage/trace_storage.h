@@ -197,17 +197,14 @@ class TraceStorage {
   // Return an unique identifier for the contents of each string.
   // The string is copied internally and can be destroyed after this called.
   // Virtual for testing.
-  virtual StringId InternString(base::StringView str) {
+  virtual StringId InternString(std::string_view str) {
     return string_pool_.InternString(str);
   }
   virtual StringId InternString(const char* str) {
-    return InternString(base::StringView(str));
+    return InternString(std::string_view(str));
   }
   virtual StringId InternString(const std::string& str) {
-    return InternString(base::StringView(str));
-  }
-  virtual StringId InternString(std::string_view str) {
-    return InternString(base::StringView(str.data(), str.size()));
+    return InternString(std::string_view(str));
   }
 
   // Reading methods.
@@ -242,6 +239,13 @@ class TraceStorage {
   }
   tables::TrackTable* mutable_track_table() {
     return mutable_table<tables::TrackTable>();
+  }
+
+  const tables::TrackDimensionTable& track_dimension_table() const {
+    return table<tables::TrackDimensionTable>();
+  }
+  tables::TrackDimensionTable* mutable_track_dimension_table() {
+    return mutable_table<tables::TrackDimensionTable>();
   }
 
   const tables::GpuContextTable& gpu_context_table() const {
@@ -392,6 +396,24 @@ class TraceStorage {
     return mutable_table<tables::AndroidInputEventDispatchTable>();
   }
 
+  const tables::AndroidJobSchedulerPendingReasonsTrackEventTable&
+  android_job_scheduler_pending_reasons_track_event_table() const {
+    return table<tables::AndroidJobSchedulerPendingReasonsTrackEventTable>();
+  }
+  tables::AndroidJobSchedulerPendingReasonsTrackEventTable*
+  mutable_android_job_scheduler_pending_reasons_track_event_table() {
+    return mutable_table<
+        tables::AndroidJobSchedulerPendingReasonsTrackEventTable>();
+  }
+
+  const tables::AndroidJobSchedulerTrackEventTable&
+  android_job_scheduler_track_event_table() const {
+    return table<tables::AndroidJobSchedulerTrackEventTable>();
+  }
+  tables::AndroidJobSchedulerTrackEventTable*
+  mutable_android_job_scheduler_track_event_table() {
+    return mutable_table<tables::AndroidJobSchedulerTrackEventTable>();
+  }
   const tables::MetadataTable& metadata_table() const {
     return table<tables::MetadataTable>();
   }
@@ -700,6 +722,14 @@ class TraceStorage {
 
   tables::AggregateSampleTable* mutable_aggregate_sample_table() {
     return mutable_table<tables::AggregateSampleTable>();
+  }
+
+  const tables::VulkanDebugNamesTable& vulkan_debug_names_table() const {
+    return table<tables::VulkanDebugNamesTable>();
+  }
+
+  tables::VulkanDebugNamesTable* mutable_vulkan_debug_names_table() {
+    return mutable_table<tables::VulkanDebugNamesTable>();
   }
 
   const tables::VulkanMemoryAllocationsTable& vulkan_memory_allocations_table()

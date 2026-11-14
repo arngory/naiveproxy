@@ -12,7 +12,6 @@
 #include <utility>
 
 #include "absl/base/nullability.h"
-#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "quiche/quic/moqt/moqt_bidi_stream.h"
@@ -52,6 +51,7 @@ class MoqtSubscribeNamespaceRequestStream : public MoqtBidiStreamBase {
   ~MoqtSubscribeNamespaceRequestStream();
 
   // MoqtBidiStreamBase overrides.
+  using MoqtBidiStreamBase::OnControlMessage;
   void OnStreamBound() override;
   absl::Status OnRawControlMessage(
       const MoqtRawControlMessage& message) override;
@@ -113,7 +113,6 @@ class MoqtSubscribeNamespaceRequestStream : public MoqtBidiStreamBase {
     // The stream is closed, so no more NAMESPACE messages are forthcoming.
     // This is an implicit NAMESPACE_DONE for all published namespaces.
     void DeclareEof();
-    MoqtResponseCallback GetResponseCallback(uint64_t request_id);
     quiche::QuicheWeakPtr<NamespaceTask> GetWeakPtr() {
       return weak_ptr_factory_.Create();
     }
@@ -133,7 +132,6 @@ class MoqtSubscribeNamespaceRequestStream : public MoqtBidiStreamBase {
     std::optional<webtransport::StreamErrorCode> error_;
     bool eof_ = false;
     uint64_t next_request_id_;
-    absl::flat_hash_map<uint64_t, MoqtResponseCallback> pending_updates_;
     // Must be last.
     quiche::QuicheWeakPtrFactory<NamespaceTask> weak_ptr_factory_;
   };
@@ -152,9 +150,11 @@ class MoqtSubscribeNamespaceResponseStream : public MoqtBidiStreamBase {
       MoqtFramer* framer, const MoqtControlMessageParser& message_parser,
       AddPrefixCallback add_callback, RemovePrefixCallback remove_callback,
       SessionErrorCallback session_error_callback,
+      ValidateRequestIdCallback validate_request_id,
       MoqtIncomingSubscribeNamespaceCallback& application);
   ~MoqtSubscribeNamespaceResponseStream() { Detach(); }
 
+  using MoqtBidiStreamBase::OnControlMessage;
   void OnStreamBound() override {
     // TODO(martinduke): Set the priority for this stream.
   }
@@ -167,12 +167,12 @@ class MoqtSubscribeNamespaceResponseStream : public MoqtBidiStreamBase {
 
  private:
   void ProcessNamespaces();
-  MoqtResponseCallback ResponseCallback(uint64_t request_id);
+  MoqtResponseCallback ResponseCallback(MoqtMessageType type_of_ok);
 
   uint64_t request_id_;
-  TrackNamespace prefix_;
   AddPrefixCallback add_callback_;
   RemovePrefixCallback remove_callback_;
+  ValidateRequestIdCallback validate_request_id_;
   MoqtIncomingSubscribeNamespaceCallback& application_;
   std::unique_ptr<MoqtNamespaceTask> task_;
   absl::flat_hash_set<TrackNamespace> published_suffixes_;

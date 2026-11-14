@@ -31,6 +31,7 @@
 #include "quiche/quic/moqt/moqt_types.h"
 #include "quiche/common/platform/api/quiche_bug_tracker.h"
 #include "quiche/common/quiche_buffer_allocator.h"
+#include "quiche/common/quiche_checked_math.h"
 #include "quiche/common/quiche_mem_slice.h"
 #include "quiche/common/quiche_weak_ptr.h"
 #include "quiche/web_transport/stream_helpers.h"
@@ -52,10 +53,21 @@ bool OutgoingUniStream::WriteObjectToStream(PublishedObject& object,
   header.subgroup_id = object.metadata.subgroup;
   header.object_id = object.metadata.location.object;
   header.publisher_priority = object.metadata.publisher_priority;
-  header.extension_headers = object.metadata.extensions;
+  header.properties = object.metadata.properties;
   header.object_status = object.metadata.status;
   header.payload_length = object.metadata.payload_length;
-
+  bool separate_end_of_group = false;
+  if (type.IsSubgroup() && !type.EndOfGroupInStream() &&
+      object.fin_after_this &&
+      object.metadata.status == MoqtObjectStatus::kEndOfGroup &&
+      (object.metadata.payload_length > 0 ||
+       !object.metadata.properties.empty())) {
+    // Handle the special case where an EndOfGroup is encoded in an object with
+    // payload or properties. It cannot be expressed that way on the wire;
+    // create a notional object instead.
+    separate_end_of_group = true;
+    header.object_status = MoqtObjectStatus::kNormal;
+  }
   quiche::QuicheBuffer serialized_header =
       framer_.SerializeObjectHeader(header, type, last_object_);
   std::vector<quiche::QuicheMemSlice> write_vector;
@@ -63,6 +75,18 @@ bool OutgoingUniStream::WriteObjectToStream(PublishedObject& object,
   write_vector.push_back(quiche::QuicheMemSlice(std::move(serialized_header)));
   for (auto& slice : object.payload) {
     write_vector.push_back(std::move(slice));
+  }
+  if (separate_end_of_group) {
+    last_object_ = object.metadata;
+    if (quiche::SafeIncrementBy<uint64_t>(header.object_id, 1)) {
+      header.object_status = MoqtObjectStatus::kEndOfGroup;
+      header.payload_length = 0;
+      header.properties.clear();
+      serialized_header =
+          framer_.SerializeObjectHeader(header, type, last_object_);
+      write_vector.push_back(
+          quiche::QuicheMemSlice(std::move(serialized_header)));
+    }
   }
   webtransport::StreamWriteOptions options;
   options.set_send_fin(!type.IsFetch() && object.fin_after_this);
@@ -76,8 +100,7 @@ bool OutgoingUniStream::WriteObjectToStream(PublishedObject& object,
     return false;
   }
   QUIC_DVLOG(1) << "Stream " << stream_.GetStreamId() << " successfully wrote "
-                << object.metadata.location
-                << ", fin = " << object.fin_after_this;
+                << object.metadata.location;
   return true;
 }
 
@@ -91,7 +114,6 @@ OutgoingSubgroupStream::OutgoingSubgroupStream(
     : OutgoingUniStream(framer, stream, priority, track_alias),
       index_(index),
       visitor_(std::move(visitor)),
-
       track_alias_(track_alias),
       publisher_(track_publisher),
       next_object_(first_object) {
@@ -165,22 +187,21 @@ void OutgoingSubgroupStream::SendObjects() {
       return;
     }
 
-    quic::QuicTimeDelta delivery_timeout = visitor->delivery_timeout();
-    if (!visitor->alternate_delivery_timeout() &&
-        visitor->clock()->ApproximateNow() - object->metadata.arrival_time >
-            delivery_timeout) {
+    quic::QuicTimeDelta delivery_timeout = visitor->object_delivery_timeout();
+    if (visitor->clock()->ApproximateNow() - object->metadata.arrival_time >
+        delivery_timeout) {
       visitor->OnStreamTimeout(index_);
       stream().ResetWithUserCode(kResetCodeDeliveryTimeout);
       // No class access below this line.
       return;
     }
-    // Always include extension header length, because it's difficult to know
+    // Always include property header length, because it's difficult to know
     // a priori if they're going to appear on a stream.
     if (!last_object().has_value()) {
       type_ = MoqtDataStreamType::Subgroup(
           index_.subgroup, next_object_, false,
           object->metadata.publisher_priority ==
-              publisher_->extensions().default_publisher_priority(),
+              publisher_->properties().default_publisher_priority(),
           object->metadata.first_object_in_subgroup.value_or(true));
     }
     uint64_t start_offset = already_delivered_;
@@ -224,15 +245,20 @@ void OutgoingSubgroupStream::SendObjects() {
     }
     ++next_object_;
     already_delivered_ = 0;
-    if (object->fin_after_this && !delivery_timeout.IsInfinite() &&
-        !visitor->alternate_delivery_timeout()) {
-      CreateAndSetAlarm(object->metadata.arrival_time + delivery_timeout);
-    }
   }
 }
 
 void OutgoingSubgroupStream::Fin(Location last_object) {
   QUICHE_DCHECK_EQ(last_object.group, index_.group);
+  LivePublisherInterface* visitor = visitor_.GetIfAvailable();
+  if (visitor != nullptr) {
+    quic::QuicTimeDelta subgroup_delivery_timeout =
+        visitor->subgroup_delivery_timeout();
+    if (!subgroup_delivery_timeout.IsInfinite()) {
+      CreateAndSetAlarm(visitor->clock()->ApproximateNow() +
+                        subgroup_delivery_timeout);
+    }
+  }
   if (next_object_ <= last_object.object) {
     // There is still data to send, do nothing.
     return;
@@ -241,14 +267,6 @@ void OutgoingSubgroupStream::Fin(Location last_object) {
   absl::Status status = webtransport::SendFinOnStream(stream());
   QUICHE_BUG_IF(OutgoingSubgroupStream_fin_failed, !status.ok())
       << "Writing pure FIN failed.";
-  LivePublisherInterface* visitor = visitor_.GetIfAvailable();
-  if (visitor == nullptr) {
-    return;
-  }
-  quic::QuicTimeDelta delivery_timeout = visitor->delivery_timeout();
-  if (!delivery_timeout.IsInfinite()) {
-    CreateAndSetAlarm(visitor->clock()->ApproximateNow() + delivery_timeout);
-  }
 }
 
 void OutgoingSubgroupStream::CreateAndSetAlarm(quic::QuicTime deadline) {
@@ -273,21 +291,28 @@ OutgoingFetchStream::OutgoingFetchStream(
     : OutgoingUniStream(framer, stream, priority, request_id),
       incoming_objects_(std::move(incoming_objects)),
       close_callback_(std::move(close_callback)) {
-  incoming_objects_->SetObjectAvailableCallback(
-      [this]() { this->OnCanWrite(); });
   trace_recorder->RecordFetchStreamCreated(stream->GetStreamId());
 }
 
-OutgoingFetchStream::~OutgoingFetchStream() {
-  if (close_callback_ != nullptr) {
-    std::move(close_callback_)();
+void OutgoingFetchStream::Init() {
+  if (incoming_objects_ != nullptr) {
+    incoming_objects_->SetObjectAvailableCallback(
+        [this]() { this->OnCanWrite(); });
   }
-  close_callback_ = nullptr;
+}
+
+OutgoingFetchStream::~OutgoingFetchStream() {
+  // If Detach() has not been called, this was not FINed and there should be a
+  // non-OK status.
+  if (status_.ok()) {
+    status_ = absl::CancelledError("stream destroyed");
+  }
+  Detach();
 }
 
 void OutgoingFetchStream::OnCanWrite() {
   PublishedObject object;
-  while (stream().CanWrite()) {
+  while (stream().CanWrite() && incoming_objects_ != nullptr) {
     MoqtFetchTask::GetNextObjectResult result =
         incoming_objects_->GetNextObject(object);
     switch (result) {
@@ -323,22 +348,36 @@ void OutgoingFetchStream::OnCanWrite() {
       case MoqtFetchTask::GetNextObjectResult::kEof:
         // TODO(martinduke): Either prefetch the next object, or alter the API
         // so that we're not sending FIN in a separate frame.
-        if (!webtransport::SendFinOnStream(stream()).ok()) {
+        status_ = webtransport::SendFinOnStream(stream());
+        if (!status_.ok()) {
           QUICHE_DVLOG(1) << "Sending FIN onStream " << stream().GetStreamId()
                           << " failed";
         }
+        Detach();
         return;
-      case MoqtFetchTask::GetNextObjectResult::kError:
-        stream().ResetWithUserCode(static_cast<webtransport::StreamErrorCode>(
-            incoming_objects_->GetStatus().code()));
+      case MoqtFetchTask::GetNextObjectResult::kError: {
+        status_ = incoming_objects_->GetStatus();
+        stream().ResetWithUserCode(StatusToMoqtStreamError(status_));
+        Detach();
         return;
+      }
     }
   }
 }
 
 void OutgoingFetchStream::OnStopSendingReceived(
     webtransport::StreamErrorCode error_code) {
+  status_ = MoqtStreamErrorToStatus(error_code, "stop sending");
   stream().ResetWithUserCode(error_code);
+  Detach();
+}
+
+void OutgoingFetchStream::Detach() {
+  if (close_callback_ != nullptr) {
+    std::move(close_callback_)(status_);
+    close_callback_ = nullptr;
+  }
+  incoming_objects_.reset();
 }
 
 IncomingDataStream::~IncomingDataStream() {
@@ -349,22 +388,11 @@ IncomingDataStream::~IncomingDataStream() {
                      "learning track alias";
     return;
   }
-  if (!track_.IsValid()) {
-    return;
+  if (status_.ok()) {
+    // Notify counterparts that the stream was not cleanly closed.
+    status_ = absl::CancelledError("stream destroyed");
   }
-  if (IsFetch()) {
-    auto fetch = absl::down_cast<UpstreamFetch*>(track_.GetIfAvailable());
-    if (fetch != nullptr) {
-      fetch->OnStreamClosed();
-    }
-    return;
-  }
-  // It's a subscribe.
-  auto subscribe = absl::down_cast<LiveSubscriber*>(track_.GetIfAvailable());
-  if (subscribe == nullptr) {
-    return;
-  }
-  subscribe->OnStreamClosed(fin_received_, index_);
+  Detach();
 }
 
 void IncomingDataStream::OnObjectMessage(const MoqtObject& message,
@@ -447,7 +475,7 @@ void IncomingDataStream::OnObjectMessage(const MoqtObject& message,
       PublishedObjectMetadata metadata;
       metadata.location = Location(message.group_id, message.object_id);
       metadata.subgroup = message.subgroup_id;
-      metadata.extensions = message.extension_headers;
+      metadata.properties = message.properties;
       metadata.status = message.object_status;
       metadata.publisher_priority = message.publisher_priority;
       metadata.first_object_in_subgroup = message.first_object_in_subgroup;
@@ -457,19 +485,14 @@ void IncomingDataStream::OnObjectMessage(const MoqtObject& message,
                                  bytes_received_this_object_);
     }
   } else {  // FETCH
-    track->OnObjectOrOk();
-    UpstreamFetch* fetch = absl::down_cast<UpstreamFetch*>(track);
-    UpstreamFetch::UpstreamFetchTask* task = fetch->task();
-    if (task == nullptr) {
-      // The application killed the FETCH.
-      stream_->SendStopSending(kResetCodeCancelled);
+    if (fetch_task_ == nullptr) {
       return;
     }
-    if (!task->HasObject()) {
-      task->NewObject(message);
+    if (!fetch_task_->HasObject()) {
+      fetch_task_->NewObject(message);
     }
-    if (task->NeedsMorePayload() && !payload.empty()) {
-      task->AppendPayloadToObject(payload);
+    if (fetch_task_->NeedsMorePayload() && !payload.empty()) {
+      fetch_task_->AppendPayloadToObject(payload);
     }
   }
   if (end_of_message) {
@@ -486,37 +509,60 @@ void IncomingDataStream::MaybeReadOneObject() {
     QUICHE_BUG(quic_bug_read_one_object_parser_unexpected_state)
         << "Requesting object, parser in unexpected state";
   }
-  if (!track_.IsValid()) {
+  if (fetch_task_ == nullptr) {
     return;
   }
-  UpstreamFetch* fetch =
-      absl::down_cast<UpstreamFetch*>(track_.GetIfAvailable());
-  UpstreamFetch::UpstreamFetchTask* task = fetch->task();
-  if (task == nullptr) {
-    return;
-  }
-  if (task->HasObject() && !task->NeedsMorePayload()) {
+  if (fetch_task_->HasObject() && !fetch_task_->NeedsMorePayload()) {
     return;  // The message is complete. Do not read more.
   }
-  uint64_t start_length = task->payload_length();
+  uint64_t start_length = fetch_task_->payload_length();
   parser_.ReadAtMostOneObject();
   // If it read an object, it called OnObjectMessage and may have altered the
   // task's object state.
-  if (task->payload_length() > start_length) {
-    task->NotifyNewObject();
+  if (fetch_task_ != nullptr && fetch_task_->payload_length() > start_length) {
+    fetch_task_->NotifyNewObject();
+  }
+}
+
+void IncomingDataStream::set_fetch_task(UpstreamFetchTask* fetch_task) {
+  fetch_task_ = fetch_task;
+  // Replace the bidi stream's callback with a new one.
+  fetch_task_->set_task_destroyed_callback([this]() {
+    fetch_task_ = nullptr;
+    stream_->SendStopSending(kResetCodeCancelled);
+    ObjectSubscriber* track = track_.GetIfAvailable();
+    if (track != nullptr) {
+      // Inform the bidi stream, since its callback was overwritten.
+      track->OnStreamClosed(
+          MoqtStreamErrorToStatus(kResetCodeCancelled, "canceled"),
+          std::nullopt);
+    }
+  });
+  fetch_task_->set_can_read_callback([this]() { MaybeReadOneObject(); });
+}
+
+void IncomingDataStream::Detach() {
+  if (fetch_task_ != nullptr) {
+    UpstreamFetchTask* fetch_task = fetch_task_;
+    fetch_task_ = nullptr;
+    fetch_task->set_can_read_callback(nullptr);
+    fetch_task->set_task_destroyed_callback(nullptr);
+    fetch_task->OnStreamAndFetchClosed(status_);
+  }
+  ObjectSubscriber* track = track_.GetIfAvailable();
+  if (track != nullptr) {
+    track->OnStreamClosed(status_, index_);
+    track_ = quiche::QuicheWeakPtr<ObjectSubscriber>();
   }
 }
 
 void IncomingDataStream::OnCanRead() {
   if (!parser_.stream_type().has_value()) {
+    // This only happens in test.
     parser_.ReadStreamType();
     if (!parser_.stream_type().has_value()) {
       return;
     }
-  }
-  if (parser_.stream_type()->IsPadding()) {
-    (void)stream_->SkipBytes(stream_->ReadableBytes());
-    return;
   }
   bool knew_track_alias = parser_.track_alias().has_value();
   if (!knew_track_alias) {
@@ -537,7 +583,7 @@ void IncomingDataStream::OnCanRead() {
         stream_->SendStopSending(kResetCodeCancelled);
         return;
       }
-      subscribe->OnStreamOpened();
+      subscribe->OnStreamOpened(this);
       parser_.set_default_publisher_priority(
           subscribe->default_publisher_priority());
       visitor_ = subscribe->visitor();
@@ -553,13 +599,19 @@ void IncomingDataStream::OnCanRead() {
     stream_->SendStopSending(kResetCodeCancelled);
     return;
   }
-  UpstreamFetch* fetch =
-      absl::down_cast<UpstreamFetch*>(track_.GetIfAvailable());
   if (!knew_track_alias) {
     // If the task already exists (FETCH_OK has arrived), the callback will
     // immediately execute to read the first object. Otherwise, it will only
-    // execute when the task is created or a cached object is read.
-    fetch->OnStreamOpened([this]() { MaybeReadOneObject(); });
+    // execute when the task is created or a cached object is read. Note that
+    // if the entire stream is delivered and closed synchronously during this
+    // call, fetch_task_ may already be null here.
+    auto track = track_.GetIfAvailable();
+    if (track == nullptr) {
+      QUICHE_BUG(quic_bug_fetch_stream_destroyed_before_track_alias_read)
+          << "Fetch stream destroyed before track alias was read";
+      return;
+    }
+    track->OnStreamOpened(this);
     return;
   }
   MaybeReadOneObject();
@@ -568,6 +620,14 @@ void IncomingDataStream::OnCanRead() {
 void IncomingDataStream::OnParsingError(MoqtError error_code,
                                         absl::string_view reason) {
   session_->Error(error_code, absl::StrCat("Parse error: ", reason));
+}
+
+IncomingPaddingStream::IncomingPaddingStream(
+    webtransport::Stream* absl_nonnull stream)
+    : stream_(stream) {}
+
+void IncomingPaddingStream::OnCanRead() {
+  (void)stream_->SkipBytes(stream_->ReadableBytes());
 }
 
 }  // namespace moqt

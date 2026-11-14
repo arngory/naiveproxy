@@ -56,6 +56,22 @@ class NET_EXPORT_PRIVATE HttpNetworkTransaction
     : public HttpTransaction,
       public HttpStreamRequest::Delegate {
  public:
+  // These values are persisted to logs. Entries should not be renumbered and
+  // numeric values should never be reused.
+  //
+  // LINT.IfChange(TerminalState)
+  enum class TerminalState : uint8_t {
+    kAborted = 0,
+    kNetworkChangedBeforeSendingRequest = 1,
+    kOtherErrorBeforeSendingRequest = 2,
+    kNetworkChangedAfterSendingRequest = 3,
+    kOtherErrorAfterSendingRequest = 4,
+    kResponseOk = 5,
+    kSuccess = 6,
+    kMaxValue = kSuccess,
+  };
+  // LINT.ThenChange(//tools/metrics/histograms/metadata/net/enums.xml:HttpNetworkTransactionTerminalState)
+
   static constexpr char kAsyncRetryOnTooManyConnectionErrorsFirstHistogram[] =
       "Net.NetworkTransaction.AsyncRetryOnTooManyConnectionErrors.First";
 
@@ -155,6 +171,10 @@ class NET_EXPORT_PRIVATE HttpNetworkTransaction
   FRIEND_TEST_ALL_PREFIXES(SpdyNetworkTransactionTest,
                            FlowControlNegativeSendWindowSize);
 
+  // Note: The declaration order of states is load-bearing. States from
+  // STATE_SEND_REQUEST_COMPLETE onward must remain after STATE_SEND_REQUEST, as
+  // DoLoop() relies on `state >= STATE_SEND_REQUEST_COMPLETE` to determine if
+  // the HTTP request has been sent when recording terminal metrics.
   enum State {
     STATE_CREATE_STREAM,
     STATE_CREATE_STREAM_COMPLETE,
@@ -186,6 +206,24 @@ class NET_EXPORT_PRIVATE HttpNetworkTransaction
   // Returns true if the request is using an HTTP(S) proxy without being
   // tunneled via the CONNECT method.
   bool UsingHttpProxyWithoutTunnel() const;
+
+  // Returns the SSLInfo of the destination server's connection. This is the
+  // sole source of certificate information for *server* authentication, used
+  // by both HandleAuthChallenge() and MaybeGenerateAuthToken(), so the two are
+  // guaranteed to observe the same value for a given `stream_`. Proxy
+  // authentication never uses this; it is always passed an empty SSLInfo.
+  //
+  // Returns an empty SSLInfo for non-secure requests, even if the connection
+  // uses TLS: an "http" request through an HTTPS proxy runs over TLS to that
+  // proxy, but that certificate belongs to the proxy rather than to the
+  // destination server, so server auth must not observe it.
+  //
+  // Consequently this never returns a proxy's certificate. When
+  // `IsSecureRequest()` is true the connection is either direct or tunneled
+  // through CONNECT -- a GET-to-proxy connection is impossible, because
+  // `UsingHttpProxyWithoutTunnel()` requires an "http" scheme -- so in both
+  // cases the top of the socket stack terminates at the destination server.
+  SSLInfo GetStreamSSLInfo();
 
   void DoCallback(int result);
   void OnIOComplete(int result);
@@ -262,6 +300,14 @@ class NET_EXPORT_PRIVATE HttpNetworkTransaction
 
   // Gets the response headers from the HttpStream.
   HttpResponseHeaders* GetResponseHeaders() const;
+
+  // Returns true if any response, including an informational (1xx) one which
+  // may no longer be included in `response_.headers`, has been received for the
+  // current request. Used to decide whether a network error may be retried,
+  // since once the server has sent a response, the error is unlikely to be the
+  // result of a race with the server timing out an idle socket without having
+  // ever seen the request.
+  bool HasReceivedResponse() const;
 
   // Called when the socket is unexpectedly closed.  Returns true if the request
   // should be resent in case of a socket reuse/close race.
@@ -412,6 +458,13 @@ class NET_EXPORT_PRIVATE HttpNetworkTransaction
   // True if we've validated the headers that the stream parser has returned.
   bool headers_valid_ = false;
 
+  // True if an informational (1xx) response was received for the current
+  // request. `response_.headers` is cleared after 1xx responses, so that a
+  // connection close before the final response isn't treated as success. This
+  // is used to continue treating such requests as having received a response
+  // for the purposes of retry logic. See HasReceivedResponse().
+  bool received_informational_response_ = false;
+
   // True if we can send the request over early data.
   bool can_send_early_data_ = false;
 
@@ -533,6 +586,12 @@ class NET_EXPORT_PRIVATE HttpNetworkTransaction
 
   // Set to true when the server required HTTP/1.1 fallback.
   bool http_1_1_was_required_ = false;
+
+  // Records whether a network change error or some other error happened, and if
+  // so whether it happened before or after sending the request. May be set
+  // multiple times if the transaction is restarted. The destructor records the
+  // final value to a histogram.
+  TerminalState terminal_state_ = TerminalState::kAborted;
 
   // If set, these values are used as DNS resolution times, rather than
   // using DNS times coming from the established stream.

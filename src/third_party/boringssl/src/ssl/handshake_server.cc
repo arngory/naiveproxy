@@ -43,6 +43,31 @@
 
 BSSL_NAMESPACE_BEGIN
 
+enum tls12_server_hs_state_t {
+  state12_start_accept = 0,
+  state12_read_client_hello,
+  state12_read_client_hello_after_ech,
+  state12_cert_callback,
+  state12_tls13,
+  state12_select_parameters,
+  state12_send_server_hello,
+  state12_send_server_certificate,
+  state12_send_server_key_exchange,
+  state12_send_server_hello_done,
+  state12_read_client_certificate,
+  state12_verify_client_certificate,
+  state12_read_client_key_exchange,
+  state12_read_client_certificate_verify,
+  state12_read_change_cipher_spec,
+  state12_process_change_cipher_spec,
+  state12_read_next_proto,
+  state12_read_channel_id,
+  state12_read_client_finished,
+  state12_send_server_finished,
+  state12_finish_server_handshake,
+  state12_done,
+};
+
 bool ssl_client_cipher_list_contains_cipher(
     const SSL_CLIENT_HELLO *client_hello, uint16_t id) {
   CBS cipher_suites;
@@ -78,6 +103,7 @@ static bool negotiate_version(SSL_HANDSHAKE *hs, uint8_t *out_alert,
       return false;
     }
   } else {
+    // clang-format off
     // Convert the ClientHello version to an equivalent supported_versions
     // extension.
     static const uint8_t kTLSVersions[] = {
@@ -90,6 +116,7 @@ static bool negotiate_version(SSL_HANDSHAKE *hs, uint8_t *out_alert,
         0xfe, 0xfd,  // DTLS 1.2
         0xfe, 0xff,  // DTLS 1.0
     };
+    // clang-format on
 
     size_t versions_len = 0;
     if (SSL_is_dtls(ssl)) {
@@ -476,10 +503,6 @@ static enum ssl_hs_wait_t do_read_client_hello(SSL_HANDSHAKE *hs) {
     return ssl_hs_error;
   }
 
-  if (hs->config->handoff) {
-    return ssl_hs_handoff;
-  }
-
   uint8_t alert = SSL_AD_DECODE_ERROR;
   // We check for rejection status in case we've rewound the state machine after
   // determining `ClientHelloInner` is invalid.
@@ -595,11 +618,13 @@ static enum ssl_hs_wait_t do_cert_callback(SSL_HANDSHAKE *hs) {
   SSLImpl *const ssl = hs->ssl;
 
   // Call `cert_cb` to update server certificates if required.
-  if (hs->config->cert->cert_cb != nullptr) {
-    int rv = hs->config->cert->cert_cb(ssl, hs->config->cert->cert_cb_arg);
+  if (hs->config->cert->cert_cb) {
+    uint8_t alert = SSL_AD_INTERNAL_ERROR;
+    int rv =
+        hs->config->cert->cert_cb(ssl, hs->config->cert->cert_cb_arg, &alert);
     if (rv == 0) {
       OPENSSL_PUT_ERROR(SSL, SSL_R_CERT_CB_ERROR);
-      ssl_send_alert(ssl, SSL3_AL_FATAL, SSL_AD_INTERNAL_ERROR);
+      ssl_send_alert(ssl, SSL3_AL_FATAL, alert);
       return ssl_hs_error;
     }
     if (rv < 0) {
@@ -714,7 +739,7 @@ static enum ssl_hs_wait_t do_select_parameters(SSL_HANDSHAKE *hs) {
       Span(client_hello.session_id, client_hello.session_id_len));
 
   // Determine whether we are doing session resumption.
-  UniquePtr<SSL_SESSION> session;
+  UniquePtr<SSLSession> session;
   bool tickets_supported = false, renew_ticket = false;
   enum ssl_hs_wait_t wait = ssl_get_prev_session(
       hs, &session, &tickets_supported, &renew_ticket, &client_hello);
@@ -806,9 +831,7 @@ static enum ssl_hs_wait_t do_select_parameters(SSL_HANDSHAKE *hs) {
     return ssl_hs_error;
   }
 
-  // Handback includes the whole handshake transcript, so we cannot free the
-  // transcript buffer in the handback case.
-  if (!hs->cert_request && !hs->handback) {
+  if (!hs->cert_request) {
     hs->transcript.FreeBuffer();
   }
 
@@ -1139,9 +1162,6 @@ static enum ssl_hs_wait_t do_send_server_hello_done(SSL_HANDSHAKE *hs) {
 static enum ssl_hs_wait_t do_read_client_certificate(SSL_HANDSHAKE *hs) {
   SSLImpl *const ssl = hs->ssl;
 
-  if (hs->handback && hs->new_cipher->algorithm_mkey == SSL_kECDHE) {
-    return ssl_hs_handback;
-  }
   if (!hs->cert_request) {
     hs->state = state12_verify_client_certificate;
     return ssl_hs_ok;
@@ -1531,9 +1551,6 @@ static enum ssl_hs_wait_t do_read_client_certificate_verify(SSL_HANDSHAKE *hs) {
 }
 
 static enum ssl_hs_wait_t do_read_change_cipher_spec(SSL_HANDSHAKE *hs) {
-  if (hs->handback && hs->ssl->session != nullptr) {
-    return ssl_hs_handback;
-  }
   hs->state = state12_process_change_cipher_spec;
   return ssl_hs_read_change_cipher_spec;
 }
@@ -1635,8 +1652,8 @@ static enum ssl_hs_wait_t do_send_server_finished(SSL_HANDSHAKE *hs) {
   SSLImpl *const ssl = hs->ssl;
 
   if (hs->ticket_expected) {
-    const SSL_SESSION *session;
-    UniquePtr<SSL_SESSION> session_copy;
+    const SSLSession *session;
+    UniquePtr<SSLSession> session_copy;
     if (ssl->session == nullptr) {
       // Fix the timeout to measure from the ticket issuance time.
       ssl_session_rebase_time(ssl, hs->new_session.get());
@@ -1685,10 +1702,6 @@ static enum ssl_hs_wait_t do_send_server_finished(SSL_HANDSHAKE *hs) {
 
 static enum ssl_hs_wait_t do_finish_server_handshake(SSL_HANDSHAKE *hs) {
   SSLImpl *const ssl = hs->ssl;
-
-  if (hs->handback) {
-    return ssl_hs_handback;
-  }
 
   ssl->method->on_handshake_complete(ssl);
 

@@ -1,5 +1,5 @@
 # Generated from 'DEPS'
-android_ndk_version = "2@30.0.16138531"
+android_ndk_version = "2@30.0.16248370"
 build_with_chromium = true
 checkout_android = false
 checkout_android_prebuilts_build_tools = false

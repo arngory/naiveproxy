@@ -13,6 +13,7 @@
 #include "absl/strings/string_view.h"
 #include "quiche/quic/core/quic_time.h"
 #include "quiche/quic/moqt/moqt_priority.h"
+#include "quiche/quic/moqt/moqt_types.h"
 #include "quiche/common/platform/api/quiche_bug_tracker.h"
 #include "quiche/common/platform/api/quiche_logging.h"
 
@@ -54,27 +55,33 @@ void SubscriptionFilter::OnLargestObject(
   switch (type_) {
     case MoqtFilterType::kAbsoluteStart:
     case MoqtFilterType::kAbsoluteRange:
-      return;
+      break;
     case MoqtFilterType::kNextGroupStart:
       if (largest_object.has_value()) {
         start_ = Location(largest_object->group + 1, 0);
+      } else {
+        start_ = Location(0, 0);
       }
       break;
     case MoqtFilterType::kLargestObject:
       if (largest_object.has_value()) {
         start_ = largest_object->Next();
+      } else {
+        start_ = Location(0, 0);
       }
       break;
   }
-  type_ = MoqtFilterType::kAbsoluteStart;
 }
 
 void MessageParameters::Update(const MessageParameters& other) {
-  if (other.delivery_timeout.has_value()) {
-    delivery_timeout = other.delivery_timeout;
+  if (other.object_delivery_timeout.has_value()) {
+    object_delivery_timeout = other.object_delivery_timeout;
   }
   if (!other.authorization_tokens.empty()) {
     authorization_tokens = other.authorization_tokens;
+  }
+  if (other.subgroup_delivery_timeout.has_value()) {
+    subgroup_delivery_timeout = other.subgroup_delivery_timeout;
   }
   if (other.expires.has_value()) {
     expires = other.expires;
@@ -95,109 +102,129 @@ void MessageParameters::Update(const MessageParameters& other) {
   if (other.new_group_request.has_value()) {
     new_group_request = other.new_group_request;
   }
+  if (other.track_namespace_prefix.has_value()) {
+    track_namespace_prefix = other.track_namespace_prefix;
+  }
   if (other.oack_window_size.has_value()) {
     oack_window_size = other.oack_window_size;
   }
 }
 
-TrackExtensions::TrackExtensions(
-    std::optional<quic::QuicTimeDelta> delivery_timeout,
+TrackProperties::TrackProperties(
+    std::optional<quic::QuicTimeDelta> object_delivery_timeout,
     std::optional<quic::QuicTimeDelta> max_cache_duration,
+    std::optional<quic::QuicTimeDelta> subgroup_delivery_timeout,
     std::optional<MoqtPriority> publisher_priority,
-    std::optional<MoqtDeliveryOrder> group_order,
+    std::optional<MoqtGroupOrder> group_order,
     std::optional<bool> dynamic_groups,
-    std::optional<absl::string_view> immutable_extensions) {
-  if (delivery_timeout.has_value() &&
-      *delivery_timeout != kDefaultDeliveryTimeout) {
-    insert(static_cast<uint64_t>(ExtensionHeader::kDeliveryTimeout),
-           static_cast<uint64_t>(delivery_timeout->ToMilliseconds()));
+    std::optional<absl::string_view> immutable_properties) {
+  if (object_delivery_timeout.has_value() &&
+      *object_delivery_timeout != kDefaultDeliveryTimeout &&
+      *object_delivery_timeout != quic::QuicTimeDelta::Zero()) {
+    insert(static_cast<uint64_t>(PropertyType::kObjectDeliveryTimeout),
+           static_cast<uint64_t>(object_delivery_timeout->ToMilliseconds()));
   }
   if (max_cache_duration.has_value() &&
       *max_cache_duration != kDefaultMaxCacheDuration) {
-    insert(static_cast<uint64_t>(ExtensionHeader::kMaxCacheDuration),
+    insert(static_cast<uint64_t>(PropertyType::kMaxCacheDuration),
            static_cast<uint64_t>(max_cache_duration->ToMilliseconds()));
   }
-  if (immutable_extensions.has_value() && !immutable_extensions->empty()) {
-    insert(static_cast<uint64_t>(ExtensionHeader::kImmutableExtensions),
-           *immutable_extensions);
+  if (subgroup_delivery_timeout.has_value() &&
+      *subgroup_delivery_timeout != kDefaultDeliveryTimeout &&
+      *subgroup_delivery_timeout != quic::QuicTimeDelta::Zero()) {
+    insert(static_cast<uint64_t>(PropertyType::kSubgroupDeliveryTimeout),
+           static_cast<uint64_t>(subgroup_delivery_timeout->ToMilliseconds()));
+  }
+  if (immutable_properties.has_value() && !immutable_properties->empty()) {
+    insert(static_cast<uint64_t>(PropertyType::kImmutableProperties),
+           *immutable_properties);
   }
   if (publisher_priority.has_value() &&
       *publisher_priority != kDefaultPublisherPriority) {
-    insert(static_cast<uint64_t>(ExtensionHeader::kDefaultPublisherPriority),
+    insert(static_cast<uint64_t>(PropertyType::kDefaultPublisherPriority),
            static_cast<uint64_t>(*publisher_priority));
   }
   if (group_order.has_value() && *group_order != kDefaultGroupOrder) {
-    insert(static_cast<uint64_t>(ExtensionHeader::kDefaultPublisherGroupOrder),
+    insert(static_cast<uint64_t>(PropertyType::kDefaultPublisherGroupOrder),
            static_cast<uint64_t>(*group_order));
   }
   if (dynamic_groups.has_value() && *dynamic_groups != kDefaultDynamicGroups) {
-    insert(static_cast<uint64_t>(ExtensionHeader::kDynamicGroups),
+    insert(static_cast<uint64_t>(PropertyType::kDynamicGroups),
            *dynamic_groups ? 1ULL : 0ULL);
   }
 }
 
-quic::QuicTimeDelta TrackExtensions::delivery_timeout() const {
+quic::QuicTimeDelta TrackProperties::object_delivery_timeout() const {
   std::optional<uint64_t> value =
-      GetValueIfExactlyOne(ExtensionHeader::kDeliveryTimeout);
-  return value.has_value() ? quic::QuicTimeDelta::FromMilliseconds(*value)
-                           : kDefaultDeliveryTimeout;
+      GetValueIfExactlyOne(PropertyType::kObjectDeliveryTimeout);
+  return (value.has_value() && *value > 0)
+             ? quic::QuicTimeDelta::FromMilliseconds(*value)
+             : kDefaultDeliveryTimeout;
 }
-
-quic::QuicTimeDelta TrackExtensions::max_cache_duration() const {
+quic::QuicTimeDelta TrackProperties::max_cache_duration() const {
   std::optional<uint64_t> value =
-      GetValueIfExactlyOne(ExtensionHeader::kMaxCacheDuration);
+      GetValueIfExactlyOne(PropertyType::kMaxCacheDuration);
   return value.has_value() ? quic::QuicTimeDelta::FromMilliseconds(*value)
                            : kDefaultMaxCacheDuration;
 }
-absl::string_view TrackExtensions::immutable_extensions() const {
+quic::QuicTimeDelta TrackProperties::subgroup_delivery_timeout() const {
+  std::optional<uint64_t> value =
+      GetValueIfExactlyOne(PropertyType::kSubgroupDeliveryTimeout);
+  return (value.has_value() && *value > 0)
+             ? quic::QuicTimeDelta::FromMilliseconds(*value)
+             : kDefaultDeliveryTimeout;
+}
+absl::string_view TrackProperties::immutable_properties() const {
   ValueVector values =
-      Get(static_cast<uint64_t>(ExtensionHeader::kImmutableExtensions));
+      Get(static_cast<uint64_t>(PropertyType::kImmutableProperties));
   return (values.size() != 1 ||
           !std::holds_alternative<absl::string_view>(values[0]))
              ? ""
              : std::get<absl::string_view>(values[0]);
 }
-MoqtPriority TrackExtensions::default_publisher_priority() const {
+MoqtPriority TrackProperties::default_publisher_priority() const {
   std::optional<uint64_t> value =
-      GetValueIfExactlyOne(ExtensionHeader::kDefaultPublisherPriority);
+      GetValueIfExactlyOne(PropertyType::kDefaultPublisherPriority);
   return (!value.has_value() || *value > kMaxPriority)
              ? kDefaultPublisherPriority
              : static_cast<MoqtPriority>(*value);
 }
-MoqtDeliveryOrder TrackExtensions::default_publisher_group_order() const {
+MoqtGroupOrder TrackProperties::default_publisher_group_order() const {
   std::optional<uint64_t> value =
-      GetValueIfExactlyOne(ExtensionHeader::kDefaultPublisherGroupOrder);
-  return (!value.has_value() || *value > kMaxMoqtDeliveryOrder ||
-          *value < kMinMoqtDeliveryOrder)
+      GetValueIfExactlyOne(PropertyType::kDefaultPublisherGroupOrder);
+  return (!value.has_value() || *value > kMaxMoqtGroupOrder ||
+          *value < kMinMoqtGroupOrder)
              ? kDefaultGroupOrder
-             : static_cast<MoqtDeliveryOrder>(*value);
+             : static_cast<MoqtGroupOrder>(*value);
 }
-bool TrackExtensions::dynamic_groups() const {
+bool TrackProperties::dynamic_groups() const {
   std::optional<uint64_t> value =
-      GetValueIfExactlyOne(ExtensionHeader::kDynamicGroups);
+      GetValueIfExactlyOne(PropertyType::kDynamicGroups);
   return (!value.has_value() || *value > 1) ? kDefaultDynamicGroups
                                             : (*value == 1);
 }
 
-bool TrackExtensions::Validate() const {
-  // TODO(martinduke): If immutable extensions include an immutable extensions
-  // extension, the track is malformed.
-  return (ValidateInner(ExtensionHeader::kDeliveryTimeout, std::nullopt,
+bool TrackProperties::Validate() const {
+  // TODO(martinduke): If immutable properties include an immutable properties
+  // property, the track is malformed.
+  return (ValidateInner(PropertyType::kObjectDeliveryTimeout, std::nullopt,
                         std::nullopt) &&
-          ValidateInner(ExtensionHeader::kMaxCacheDuration, std::nullopt,
+          ValidateInner(PropertyType::kMaxCacheDuration, std::nullopt,
                         std::nullopt) &&
-          ValidateInner(ExtensionHeader::kDefaultPublisherPriority,
-                        std::nullopt, kMaxPriority) &&
-          ValidateInner(ExtensionHeader::kDefaultPublisherGroupOrder,
-                        kMinMoqtDeliveryOrder, kMaxMoqtDeliveryOrder) &&
-          ValidateInner(ExtensionHeader::kDynamicGroups, 0, 1) &&
-          count(static_cast<uint64_t>(ExtensionHeader::kImmutableExtensions)) <=
+          ValidateInner(PropertyType::kSubgroupDeliveryTimeout, std::nullopt,
+                        std::nullopt) &&
+          ValidateInner(PropertyType::kDefaultPublisherPriority, std::nullopt,
+                        kMaxPriority) &&
+          ValidateInner(PropertyType::kDefaultPublisherGroupOrder,
+                        kMinMoqtGroupOrder, kMaxMoqtGroupOrder) &&
+          ValidateInner(PropertyType::kDynamicGroups, 0, 1) &&
+          count(static_cast<uint64_t>(PropertyType::kImmutableProperties)) <=
               1);
 }
 
 // private
-std::optional<uint64_t> TrackExtensions::GetValueIfExactlyOne(
-    ExtensionHeader header) const {
+std::optional<uint64_t> TrackProperties::GetValueIfExactlyOne(
+    PropertyType header) const {
   QUICHE_BUG_IF(moqt_bug_must_be_even, (static_cast<uint64_t>(header) % 2) == 1)
       << "MoqtKeyValuePair extracting integer from odd key.";
   ValueVector values = Get(static_cast<uint64_t>(header));
@@ -207,7 +234,7 @@ std::optional<uint64_t> TrackExtensions::GetValueIfExactlyOne(
   return std::get<uint64_t>(values[0]);
 }
 
-bool TrackExtensions::ValidateInner(ExtensionHeader header,
+bool TrackProperties::ValidateInner(PropertyType header,
                                     std::optional<uint64_t> min,
                                     std::optional<uint64_t> max) const {
   ValueVector values = Get(static_cast<uint64_t>(header));

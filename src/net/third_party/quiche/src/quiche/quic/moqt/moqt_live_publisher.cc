@@ -15,8 +15,8 @@
 #include "absl/base/nullability.h"
 #include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
 #include "absl/strings/string_view.h"
-#include "quiche/quic/core/quic_clock.h"
 #include "quiche/quic/moqt/moqt_bidi_stream.h"
 #include "quiche/quic/moqt/moqt_error.h"
 #include "quiche/quic/moqt/moqt_framer.h"
@@ -61,6 +61,10 @@ LivePublisher::LivePublisher(
   if (monitoring_interface_ != nullptr) {
     monitoring_interface_->OnObjectAckSupportKnown(parameters.oack_window_size);
   }
+  if (is_publish) {
+    parameters_.group_order =
+        track_publisher_->properties().default_publisher_group_order();
+  }
   QUIC_DLOG(INFO) << "Created subscription for "
                   << track_publisher_->GetTrackName();
   // TODO(martinduke): Handle NEW_GROUP_REQUEST
@@ -72,14 +76,40 @@ LivePublisher::~LivePublisher() {
   }
 }
 
-void LivePublisher::Update(const MessageParameters& parameters) {
-  // TODO(martinduke): If there are auth tokens, this probably has to go to the
-  // application.
+void LivePublisher::Update(const MessageParameters& parameters,
+                           bool from_request_ok) {
+  absl::Status pub_status =
+      track_publisher_->UpdateObjectListener(this, parameters);
+  if (!pub_status.ok()) {
+    if (!from_request_ok) {
+      PublishIsDone(PublishDoneCode::kUpdateFailed, "Update failed");
+      bidi_stream_->CheckStatus(
+          bidi_stream_->SendRequestError(StatusToMoqtRequestError(pub_status)));
+    } else {
+      bidi_stream_->Reset(StatusToMoqtStreamError(pub_status));
+    }
+    return;
+  }
+  MessageParameters response;
   // TODO(martinduke): If the subscribe window has shrunk, close any streams
   // that are now outside the window. Also send PUBLISH_DONE if now done.
   MoqtPriority old_priority =
       parameters_.subscriber_priority.value_or(kDefaultSubscriberPriority);
+  // Does this update set forward to true?
+  bool forward_to_1 = !parameters_.forward() &&
+                      parameters.forward_has_value() && parameters.forward();
+  response.largest_object = track_publisher_->largest_location();
+  parameters_.largest_object = response.largest_object;
   parameters_.Update(parameters);
+  if (parameters_.subscription_filter.has_value() &&
+      parameters_.largest_object.has_value() &&
+      (!parameters_.subscription_filter->WindowKnown() || forward_to_1)) {
+    // Initialize the filter if:
+    // - Forward is going 0->1 (this could be a re-initialization)
+    // - This the first LARGEST_OBJECT sent.
+    // - There's a new filter that has to be initialized from LARGEST_OBJECT.
+    parameters_.subscription_filter->OnLargestObject(response.largest_object);
+  }
   if (parameters.subscriber_priority.has_value()) {  // priority changed.
     MoqtPriority new_priority = *parameters.subscriber_priority;
     // Reprioritize all active streams.
@@ -92,21 +122,20 @@ void LivePublisher::Update(const MessageParameters& parameters) {
           absl::down_cast<OutgoingSubgroupStream*>(stream->visitor());
       outgoing_stream->UpdatePriority(new_priority);
     }
-    if (pending_streams_.empty()) {
-      return;
+    if (!pending_streams_.empty() && visitor() != nullptr) {
+      // Tell the session that pending stream priority has changed.
+      MoqtPriority publisher_priority =
+          pending_streams_.rbegin()->second.publisher_priority.value_or(
+              track_publisher_->properties().default_publisher_priority());
+      MoqtTrackPriority old_track_priority = {old_priority, publisher_priority};
+      visitor()->UpdateTrackPriority(
+          track_publisher_->GetTrackName(), old_track_priority,
+          MoqtTrackPriority{new_priority, publisher_priority});
     }
-    // Tell the session that pending stream priority has changed.
-    MoqtPriority publisher_priority =
-        pending_streams_.rbegin()->second.publisher_priority.value_or(
-            track_publisher_->extensions().default_publisher_priority());
-    MoqtTrackPriority old_track_priority = {old_priority, publisher_priority};
-    if (visitor() == nullptr) {
-      return;
-    }
-    visitor()->UpdateTrackPriority(
-        request_id_, old_track_priority,
-        MoqtTrackPriority{new_priority, publisher_priority});
-    // Don't bother to update all the pending stream send orders.
+  }
+  if (!from_request_ok) {
+    bidi_stream_->CheckStatus(
+        bidi_stream_->SendRequestOk(response, MoqtMessageType::kRequestUpdate));
   }
 }
 
@@ -123,6 +152,12 @@ void LivePublisher::ResetAllStreams() {
 }
 
 void LivePublisher::OnSubscribeAccepted() {
+  publisher_subgroup_delivery_timeout_ =
+      track_publisher_->properties().subgroup_delivery_timeout();
+  publisher_object_delivery_timeout_ =
+      track_publisher_->properties().object_delivery_timeout();
+  default_publisher_priority_ =
+      track_publisher_->properties().default_publisher_priority();
   if (established_) {
     return;  // It's a PUBLISH.
   }
@@ -133,29 +168,36 @@ void LivePublisher::OnSubscribeAccepted() {
         parameters_.largest_object);
   }
   MoqtSubscribeOk subscribe_ok;
-  subscribe_ok.request_id = request_id_;
   subscribe_ok.track_alias = track_alias_;
   subscribe_ok.parameters.expires = track_publisher_->expiration();
   subscribe_ok.parameters.largest_object = parameters_.largest_object;
-  subscribe_ok.extensions = track_publisher_->extensions();
+  subscribe_ok.properties = track_publisher_->properties();
   if (!parameters_.group_order.has_value()) {
     parameters_.group_order =
-        subscribe_ok.extensions.default_publisher_group_order();
+        subscribe_ok.properties.default_publisher_group_order();
   }
-  // TODO(martinduke): Support sending DELIVERY_TIMEOUT parameter as the
-  // publisher.
-  default_publisher_priority_ =
-      subscribe_ok.extensions.default_publisher_priority();
   bidi_stream_->SendOrBufferMessageOrFatal(
       framer_.SerializeSubscribeOk(subscribe_ok));
+  // It is now safe to process buffered REQUEST_UPDATEs.
+  std::optional<MessageParameters> next_update =
+      bidi_stream_->NextIncomingUpdate();
+  // Get a weak_pointer to LivePublisher in case it is destroyed by Update().
+  quiche::QuicheWeakPtr<LivePublisherInterface> self =
+      weak_ptr_factory_.Create();
+  while (self.IsValid() && next_update.has_value()) {
+    Update(*next_update, /*from_request_ok=*/false);
+    if (!self.IsValid()) {
+      return;
+    }
+    next_update = bidi_stream_->NextIncomingUpdate();
+  }
   // TODO(martinduke): If we buffer objects that arrived previously, the arrival
   // of the track alias disambiguates what subscription they belong to. Send
   // them.
 }
 
 void LivePublisher::OnSubscribeRejected(MoqtRequestErrorInfo info) {
-  bidi_stream_->CheckStatus(bidi_stream_->SendRequestError(request_id_, info,
-                                                           /*fin=*/true));
+  bidi_stream_->CheckStatus(bidi_stream_->SendRequestError(info));
   // Sending FIN will delete the class.
 }
 
@@ -181,11 +223,10 @@ void LivePublisher::OnNewObjectAvailable(Location location,
       monitoring_interface_->OnNewObjectEnqueued(location);
     }
   }
-
   // TODO(vasilvv): This currently sends UINT64_MAX for datagram subgroups.
   // Maybe do something more satisfactory?
   SessionToPublisherInterface* session_info = visitor();
-  if (session_info == nullptr) {
+  if (session_info == nullptr || session_info->session() == nullptr) {
     return;  // Session is gone.
   }
   session_info->trace_recorder().RecordNewObjectAvaliable(
@@ -200,25 +241,6 @@ void LivePublisher::OnNewObjectAvailable(Location location,
       return;
     }
     stream_id = stream_map_.GetStreamFor(index);
-  }
-  if (session_info->alternate_delivery_timeout() &&
-      !delivery_timeout().IsInfinite() && largest_sent_.has_value() &&
-      location.group >= largest_sent_->group) {
-    // Start the delivery timeout timer on all previous groups.
-    for (uint64_t group = first_active_group_; group < location.group;
-         ++group) {
-      for (webtransport::StreamId stream_to_update :
-           stream_map_.GetStreamsForGroup(group)) {
-        webtransport::Stream* raw_stream = GetStreamById(stream_to_update);
-        if (raw_stream == nullptr) {
-          continue;
-        }
-        OutgoingSubgroupStream* stream =
-            absl::down_cast<OutgoingSubgroupStream*>(raw_stream->visitor());
-        stream->CreateAndSetAlarm(session_info->clock()->ApproximateNow() +
-                                  delivery_timeout());
-      }
-    }
   }
   QUICHE_DCHECK_GE(location.group, first_active_group_);
   if (!subgroup.has_value()) {
@@ -244,7 +266,7 @@ void LivePublisher::OnNewObjectAvailable(Location location,
     StreamRank rank = StreamRankFor(parameters);
     if (pending_streams_.empty() || rank > pending_streams_.rbegin()->first) {
       session_info->UpdateTrackPriority(
-          request_id_,
+          track_publisher_->GetTrackName(),
           /*old_priority=*/pending_streams_.empty()
               ? std::optional<MoqtTrackPriority>()
               : std::make_optional(
@@ -254,6 +276,10 @@ void LivePublisher::OnNewObjectAvailable(Location location,
                                               default_publisher_priority())}),
           MoqtTrackPriority{subscriber_priority(), publisher_priority});
     }
+    // TODO(martinduke): We are not properly enforcing SUBGROUP_DELIVERY_TIMEOUT
+    // for pending streams. When LivePublisher receives OnNewFinAvailable(), it
+    // should check pending streams (which ought to be accessible by index, not
+    // just rank) and start a timer on them.
     pending_streams_.emplace(rank, parameters);
   }
 }
@@ -286,7 +312,7 @@ void LivePublisher::OnNewFinAvailable(Location location, uint64_t subgroup) {
 void LivePublisher::OnSubgroupAbandoned(
     uint64_t group, uint64_t subgroup,
     webtransport::StreamErrorCode error_code) {
-  if (!InWindow(group)) {
+  if (!InWindow(group) || group < first_active_group_) {
     return;
   }
   DataStreamIndex index(group, subgroup);
@@ -295,7 +321,6 @@ void LivePublisher::OnSubgroupAbandoned(
     return;
   }
   reset_subgroups_.insert(index);
-  QUICHE_DCHECK_GE(group, first_active_group_);
   std::optional<webtransport::StreamId> stream_id =
       stream_map_.GetStreamFor(index);
   if (!stream_id.has_value()) {
@@ -315,7 +340,8 @@ void LivePublisher::OnGroupAbandoned(uint64_t group_id) {
   }
   std::vector<webtransport::StreamId> streams =
       stream_map_.GetStreamsForGroup(group_id);
-  if (delivery_timeout().IsInfinite() && largest_sent_.has_value() &&
+  if (subgroup_delivery_timeout().IsInfinite() &&
+      object_delivery_timeout().IsInfinite() && largest_sent_.has_value() &&
       largest_sent_->group <= group_id) {
     PublishIsDone(PublishDoneCode::kTooFarBehind, "");
     // No class access below this line!
@@ -349,16 +375,23 @@ void LivePublisher::SendDatagram(Location sequence) {
   header.group_id = object->metadata.location.group;
   header.object_id = object->metadata.location.object;
   header.publisher_priority = object->metadata.publisher_priority;
-  header.extension_headers = object->metadata.extensions;
+  header.properties = object->metadata.properties;
   header.object_status = object->metadata.status;
   header.subgroup_id = std::nullopt;
   header.payload_length = object->metadata.payload_length;
   QUICHE_BUG_IF(LivePublisher_SendDatagram_partial_payload,
                 object->payload.size() > 1)
       << "Datagram is split into multiple slices";
-  quiche::QuicheBuffer datagram = framer_.SerializeObjectDatagram(
-      header, object->payload[0].AsStringView(),
-      default_publisher_priority_.value_or(kDefaultPublisherPriority));
+  quiche::QuicheBuffer datagram;
+  if (object->payload.empty()) {
+    datagram = framer_.SerializeObjectDatagram(
+        header, "",
+        default_publisher_priority_.value_or(kDefaultPublisherPriority));
+  } else {
+    datagram = framer_.SerializeObjectDatagram(
+        header, object->payload[0].AsStringView(),
+        default_publisher_priority_.value_or(kDefaultPublisherPriority));
+  }
   if (visitor() == nullptr) {
     return;
   }
@@ -409,7 +442,6 @@ webtransport::Stream* absl_nullable LivePublisher::OpenDataStream(
 void LivePublisher::PublishIsDone(PublishDoneCode code,
                                   absl::string_view error_reason) {
   MoqtPublishDone publish_done;
-  publish_done.request_id = request_id_;
   publish_done.status_code = code;
   publish_done.stream_count = streams_opened_;
   publish_done.error_reason = error_reason;
@@ -419,7 +451,9 @@ void LivePublisher::PublishIsDone(PublishDoneCode code,
   QUICHE_DLOG(INFO) << "Sending PUBLISH_DONE message for "
                     << track_publisher_->GetTrackName();
   bidi_stream_->SendOrBufferMessageOrFatal(
-      framer_.SerializePublishDone(publish_done), /*fin=*/true);
+      framer_.SerializePublishDone(publish_done),
+      // Don't send FIN if the UPDATE failed; REQUEST_ERROR will follow.
+      /*fin=*/code != PublishDoneCode::kUpdateFailed);
   // sending FIN will delete the class.
 }
 
@@ -450,7 +484,7 @@ void LivePublisher::OnCanCreateNewUniStream() {
     pending_streams_.erase(--(it.base()));
     if (!pending_streams_.empty()) {
       session_info->UpdateTrackPriority(
-          request_id_, std::nullopt,
+          track_publisher_->GetTrackName(), std::nullopt,
           MoqtTrackPriority{
               subscriber_priority(),
               pending_streams_.rbegin()->second.publisher_priority.value_or(

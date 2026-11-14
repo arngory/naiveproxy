@@ -209,9 +209,13 @@ const char* AllActiveSessionsGoingAwayReasonToString(
       return "CertDBChanged";
     case kCertVerifierChanged:
       return "CertVerifierChanged";
+    case kSSLContextConfigChanged:
+      return "SSLContextConfigChanged";
   }
 }
 
+// TODO(crbug.com/557126867): Deprecate `HistogramCreateSessionFailure` and
+// `Net.QuicSession.CreationError` in favor of `QuicSocketConfigStep`.
 void HistogramCreateSessionFailure(enum CreateSessionFailure error) {
   UMA_HISTOGRAM_ENUMERATION("Net.QuicSession.CreationError", error,
                             CREATION_ERROR_MAX);
@@ -388,6 +392,19 @@ base::TimeDelta GetAdditionalDelayForMainJob() {
     return base::TimeDelta();
   }
   return features::kAdditionalDelay.Get();
+}
+
+std::optional<int> GetQuicSocketSendBufferSize() {
+  if (base::FeatureList::IsEnabled(features::kQuicSocketSendBufferSize)) {
+    int size = features::kQuicSocketSendBufferSizeParam.Get();
+    if (size == -1) {
+      // The default OS value for the send buffer size will be used in this
+      // case.
+      return std::nullopt;
+    }
+    return size;
+  }
+  return quic::kMaxOutgoingPacketSize * 20;
 }
 
 }  // namespace
@@ -627,7 +644,7 @@ void QuicSessionPool::QuicCryptoClientConfigOwner::OnMemoryPressure(
   if (base::FeatureList::IsEnabled(base::kStatefulMemoryPressure)) {
     // The memory pressure level might have changed, which potentially changed
     // the memory limit. Enforce the new limit.
-    session_cache->UpdateMaxSize(max_cache_entries_ * GetMemoryLimitRatio());
+    session_cache->UpdateMaxSize(GetMemoryLimit().Scale(max_cache_entries_));
     return;
   }
 
@@ -656,9 +673,11 @@ bool QuicSessionPool::QuicCryptoClientConfigKey::operator<(
 
 std::tuple<const NetworkAnonymizationKey&,
            const ProxyChain&,
-           const SessionUsage&>
+           const SessionUsage&,
+           QuicSessionPool::SSLContextConfigGeneration>
 QuicSessionPool::QuicCryptoClientConfigKey::Tie() const {
-  return std::tie(network_anonymization_key, proxy_chain, session_usage);
+  return std::tie(network_anonymization_key, proxy_chain, session_usage,
+                  ssl_config_generation);
 }
 
 QuicSessionPool::CryptoClientConfigHandle::CryptoClientConfigHandle(
@@ -747,6 +766,7 @@ QuicSessionPool::QuicSessionPool(
   InitializeMigrationOptions();
   cert_verifier_->AddObserver(this);
   CertDatabase::GetInstance()->AddObserver(this);
+  ssl_config_service_->AddObserver(this);
 #if BUILDFLAG(IS_ANDROID)
   RegisterPreFreezeTask();
 #endif
@@ -776,6 +796,7 @@ QuicSessionPool::~QuicSessionPool() {
 
   CertDatabase::GetInstance()->RemoveObserver(this);
   cert_verifier_->RemoveObserver(this);
+  ssl_config_service_->RemoveObserver(this);
   if (params_.close_sessions_on_ip_change ||
       params_.goaway_sessions_on_ip_change) {
     NetworkChangeNotifier::RemoveIPAddressObserver(this);
@@ -1007,6 +1028,7 @@ int QuicSessionPool::RequestSession(
     active_jobs_[session_key] = std::move(job);
     return rv;
   }
+
   if (rv == OK) {
     auto it = active_sessions_.find(session_key);
     CHECK(it != active_sessions_.end());
@@ -1014,7 +1036,10 @@ int QuicSessionPool::RequestSession(
       return ERR_QUIC_PROTOCOL_ERROR;
     }
     QuicChromiumClientSession* session = it->second;
+    job->RecordCompleteTime(session);
     request->SetSession(session->CreateHandle(std::move(destination)));
+  } else {
+    job->RecordCompleteTime(/*session=*/nullptr);
   }
   return rv;
 }
@@ -1193,11 +1218,12 @@ void QuicSessionPool::ClearCachedStatesInCryptoConfig(
   }
 }
 
-void QuicSessionPool::ConnectAndConfigureSocket(CompletionOnceCallback callback,
-                                                DatagramClientSocket* socket,
-                                                IPEndPoint addr,
-                                                handles::NetworkHandle network,
-                                                const SocketTag& socket_tag) {
+void QuicSessionPool::ConnectAndConfigureSocket(
+    ConnectAndConfigureCallback callback,
+    DatagramClientSocket* socket,
+    IPEndPoint addr,
+    handles::NetworkHandle network,
+    const SocketTag& socket_tag) {
   socket->UseNonBlockingIO();
 
   int rv;
@@ -1226,13 +1252,13 @@ void QuicSessionPool::ConnectAndConfigureSocket(CompletionOnceCallback callback,
 }
 
 void QuicSessionPool::FinishConnectAndConfigureSocket(
-    CompletionOnceCallback callback,
+    ConnectAndConfigureCallback callback,
     DatagramClientSocket* socket,
     const SocketTag& socket_tag,
     int rv) {
   if (rv != OK) {
-    OnFinishConnectAndConfigureSocketError(
-        std::move(callback), CREATION_ERROR_CONNECTING_SOCKET, rv);
+    OnFinishConnectAndConfigureSocketError(std::move(callback),
+                                           QuicSocketConfigStep::kConnect, rv);
     return;
   }
 
@@ -1241,7 +1267,7 @@ void QuicSessionPool::FinishConnectAndConfigureSocket(
   rv = socket->SetReceiveBufferSize(kQuicSocketReceiveBufferSize);
   if (rv != OK) {
     OnFinishConnectAndConfigureSocketError(
-        std::move(callback), CREATION_ERROR_SETTING_RECEIVE_BUFFER, rv);
+        std::move(callback), QuicSocketConfigStep::kSetReceiveBufferSize, rv);
     return;
   }
 
@@ -1249,25 +1275,25 @@ void QuicSessionPool::FinishConnectAndConfigureSocket(
   // SetDoNotFragment is not implemented on all platforms, so ignore errors.
   if (rv != OK && rv != ERR_NOT_IMPLEMENTED) {
     OnFinishConnectAndConfigureSocketError(
-        std::move(callback), CREATION_ERROR_SETTING_DO_NOT_FRAGMENT, rv);
+        std::move(callback), QuicSocketConfigStep::kSetDoNotFragment, rv);
     return;
   }
 
   rv = socket->SetRecvTos();
   if (rv != OK) {
     OnFinishConnectAndConfigureSocketError(
-        std::move(callback), CREATION_ERROR_SETTING_RECEIVE_ECN, rv);
+        std::move(callback), QuicSocketConfigStep::kSetReceiveEcn, rv);
     return;
   }
 
-  // Set a buffer large enough to contain the initial CWND's worth of packet
-  // to work around the problem with CHLO packets being sent out with the
-  // wrong encryption level, when the send buffer is full.
-  rv = socket->SetSendBufferSize(quic::kMaxOutgoingPacketSize * 20);
-  if (rv != OK) {
-    OnFinishConnectAndConfigureSocketError(
-        std::move(callback), CREATION_ERROR_SETTING_SEND_BUFFER, rv);
-    return;
+  std::optional<int> send_buffer_size = GetQuicSocketSendBufferSize();
+  if (send_buffer_size.has_value()) {
+    rv = socket->SetSendBufferSize(send_buffer_size.value());
+    if (rv != OK) {
+      OnFinishConnectAndConfigureSocketError(
+          std::move(callback), QuicSocketConfigStep::kSetSendBufferSize, rv);
+      return;
+    }
   }
 
   if (params_.ios_network_service_type > 0) {
@@ -1289,8 +1315,9 @@ void QuicSessionPool::FinishConnectAndConfigureSocket(
 
   base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
       FROM_HERE,
-      base::BindOnce(&QuicSessionPool::DoCallback, weak_factory_.GetWeakPtr(),
-                     std::move(callback), rv));
+      base::BindOnce(&QuicSessionPool::DoConnectAndConfigureCallback,
+                     weak_factory_.GetWeakPtr(), std::move(callback), rv,
+                     /*error_step=*/std::nullopt));
 }
 
 bool QuicSessionPool::CanWaiveIpMatching(
@@ -1316,19 +1343,40 @@ bool QuicSessionPool::CanWaiveIpMatching(
 }
 
 void QuicSessionPool::OnFinishConnectAndConfigureSocketError(
-    CompletionOnceCallback callback,
-    enum CreateSessionFailure error,
+    ConnectAndConfigureCallback callback,
+    QuicSocketConfigStep step,
     int rv) {
   DCHECK(callback);
-  HistogramCreateSessionFailure(error);
+  // TODO(crbug.com/557126867): Remove this switch once `CreateSessionFailure`
+  // and its related UMA logging are deprecated.
+  switch (step) {
+    case QuicSocketConfigStep::kConnect:
+      HistogramCreateSessionFailure(CREATION_ERROR_CONNECTING_SOCKET);
+      break;
+    case QuicSocketConfigStep::kSetReceiveBufferSize:
+      HistogramCreateSessionFailure(CREATION_ERROR_SETTING_RECEIVE_BUFFER);
+      break;
+    case QuicSocketConfigStep::kSetDoNotFragment:
+      HistogramCreateSessionFailure(CREATION_ERROR_SETTING_DO_NOT_FRAGMENT);
+      break;
+    case QuicSocketConfigStep::kSetReceiveEcn:
+      HistogramCreateSessionFailure(CREATION_ERROR_SETTING_RECEIVE_ECN);
+      break;
+    case QuicSocketConfigStep::kSetSendBufferSize:
+      HistogramCreateSessionFailure(CREATION_ERROR_SETTING_SEND_BUFFER);
+      break;
+  }
   base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
-      FROM_HERE,
-      base::BindOnce(&QuicSessionPool::DoCallback, weak_factory_.GetWeakPtr(),
-                     std::move(callback), rv));
+      FROM_HERE, base::BindOnce(&QuicSessionPool::DoConnectAndConfigureCallback,
+                                weak_factory_.GetWeakPtr(), std::move(callback),
+                                rv, step));
 }
 
-void QuicSessionPool::DoCallback(CompletionOnceCallback callback, int rv) {
-  std::move(callback).Run(rv);
+void QuicSessionPool::DoConnectAndConfigureCallback(
+    ConnectAndConfigureCallback callback,
+    int rv,
+    std::optional<QuicSocketConfigStep> error_step) {
+  std::move(callback).Run(rv, error_step);
 }
 
 int QuicSessionPool::ConfigureSocket(DatagramClientSocket* socket,
@@ -1372,13 +1420,13 @@ int QuicSessionPool::ConfigureSocket(DatagramClientSocket* socket,
     return rv;
   }
 
-  // Set a buffer large enough to contain the initial CWND's worth of packet
-  // to work around the problem with CHLO packets being sent out with the
-  // wrong encryption level, when the send buffer is full.
-  rv = socket->SetSendBufferSize(quic::kMaxOutgoingPacketSize * 20);
-  if (rv != OK) {
-    HistogramCreateSessionFailure(CREATION_ERROR_SETTING_SEND_BUFFER);
-    return rv;
+  std::optional<int> send_buffer_size = GetQuicSocketSendBufferSize();
+  if (send_buffer_size.has_value()) {
+    rv = socket->SetSendBufferSize(send_buffer_size.value());
+    if (rv != OK) {
+      HistogramCreateSessionFailure(CREATION_ERROR_SETTING_SEND_BUFFER);
+      return rv;
+    }
   }
 
   if (params_.ios_network_service_type > 0) {
@@ -1562,6 +1610,16 @@ void QuicSessionPool::OnTrustStoreChanged() {
 void QuicSessionPool::OnCertVerifierChanged() {
   // Flush sessions if the CertCerifier configuration has changed.
   MarkAllActiveSessionsGoingAway(kCertVerifierChanged);
+}
+
+void QuicSessionPool::OnSSLContextConfigChanged() {
+  ssl_config_generation_ = ssl_config_generation_generator_.GenerateNextId();
+  // Clear cached configs that must have been created under the previous
+  // SSLContextConfig.
+  recent_crypto_config_map_.Clear();
+  // Flush sessions if the SSL configuration has changed. Configs will be
+  // dropped from `active_crypto_config_map_` as old sessions drain.
+  MarkAllActiveSessionsGoingAway(kSSLContextConfigChanged);
 }
 
 void QuicSessionPool::set_has_quic_ever_worked_on_current_network(
@@ -1799,19 +1857,24 @@ void QuicSessionPool::OnJobComplete(
   job->set_is_deleting();
 
   if (rv == OK) {
+    auto session_it = active_sessions_.find(job->key().session_key());
+    CHECK(session_it != active_sessions_.end());
+    QuicChromiumClientSession* session = session_it->second;
+    job->RecordCompleteTime(session);
+
     if (!has_quic_ever_worked_on_current_network_) {
       set_has_quic_ever_worked_on_current_network(true);
     }
 
-    auto session_it = active_sessions_.find(job->key().session_key());
-    CHECK(session_it != active_sessions_.end());
-    QuicChromiumClientSession* session = session_it->second;
     for (QuicSessionRequest* request : job->requests()) {
       // Do not notify |request| yet.
       request->SetSession(session->CreateHandle(job->key().destination()));
     }
-  } else if (rv < 0) {
-    NotifyOnConnectionFailure(job->key().session_key());
+  } else {
+    job->RecordCompleteTime(/*session=*/nullptr);
+    if (rv < 0) {
+      NotifyOnConnectionFailure(job->key().session_key());
+    }
   }
 
   for (QuicSessionRequest* request : job->requests()) {
@@ -1851,49 +1914,31 @@ QuicConnectionReuseDetails QuicSessionPool::DetermineQuicConnectionReuseDetails(
   bool has_disconnected = false;
   bool has_other_going_away = false;
 
-  bool has_inflight_preconnect = false;
-  bool has_inflight_non_preconnect = false;
-  std::optional<QuicSessionKey> mismatched_inflight_key;
-
-  // Step 1: Check if one or more sessions with the exact matching
+  // Step 1: Check if one or more established sessions with the exact matching
   // `quic_session_key()` already exist in `all_sessions_`.
   // Note: Since `DetermineQuicConnectionReuseDetails()` is only called when no
   // active session could be reused directly from `active_sessions_`, any
   // matching session found here must be in a non-active state (e.g. draining,
-  // disconnected, or received a GOAWAY frame) or still in the process of
-  // connecting / handshaking.
+  // disconnected, or received a GOAWAY frame).
   for (const auto& session : all_sessions_) {
     if (session_key == session->quic_session_key()) {
       if (!session->OneRttKeysAvailable()) {
-        if (session->connection() && session->connection()->connected()) {
-          if (session->session_creation_initiator() ==
-              MultiplexedSessionCreationInitiator::kPreconnect) {
-            has_inflight_preconnect = true;
-          } else {
-            has_inflight_non_preconnect = true;
-          }
-        }
-      } else {
-        if (session->session_creation_initiator() ==
-            MultiplexedSessionCreationInitiator::kPreconnect) {
-          has_preconnect = true;
-        } else {
-          has_non_preconnect = true;
-        }
-        if (session->goaway_received()) {
-          has_goaway = true;
-        } else if (!session->connection() ||
-                   !session->connection()->connected()) {
-          has_disconnected = true;
-        } else {
-          has_other_going_away = true;
-        }
+        continue;
       }
-    } else if (!session->OneRttKeysAvailable() && session->connection() &&
-               session->connection()->connected() &&
-               session_key.server_id() == session->server_id() &&
-               !mismatched_inflight_key) {
-      mismatched_inflight_key = session->quic_session_key();
+      if (session->session_creation_initiator() ==
+          MultiplexedSessionCreationInitiator::kPreconnect) {
+        has_preconnect = true;
+      } else {
+        has_non_preconnect = true;
+      }
+      if (session->goaway_received()) {
+        has_goaway = true;
+      } else if (!session->connection() ||
+                 !session->connection()->connected()) {
+        has_disconnected = true;
+      } else {
+        has_other_going_away = true;
+      }
     }
   }
 
@@ -1922,39 +1967,25 @@ QuicConnectionReuseDetails QuicSessionPool::DetermineQuicConnectionReuseDetails(
   } else if (has_non_preconnect) {
     details.establishment_reason =
         QuicSessionEstablishmentReason::kSessionExistedButNotPreconnect;
-  } else if (has_inflight_preconnect) {
-    details.establishment_reason =
-        QuicSessionEstablishmentReason::kInflightSessionAndWasPreconnect;
-  } else if (has_inflight_non_preconnect) {
-    details.establishment_reason =
-        QuicSessionEstablishmentReason::kInflightSessionButNotPreconnect;
-  } else {
-    details.establishment_reason =
-        QuicSessionEstablishmentReason::kNoSessionExisted;
   }
 
-  // If matching session(s) existed in `all_sessions_` (established or
-  // in-flight), we have already determined the establishment reason (and
-  // non-reuse reason for established sessions).
-  if (details.establishment_reason !=
-      QuicSessionEstablishmentReason::kNoSessionExisted) {
+  // If established session(s) existed in `all_sessions_`, we have already
+  // determined the establishment reason and non-reuse reason.
+  if (details.establishment_reason.has_value()) {
     return details;
   }
 
-  // Step 2: No exact matching session existed in `all_sessions_`.
-  // Check if there is an active session or active job targeting the same server
-  // (ServerId / host & port). If so, identify which key fields caused the
-  // partition mismatch preventing reuse.
-  std::optional<QuicSessionKey> active_key =
-      GetActiveSessionToServerId(session_key);
-  if (!active_key) {
-    active_key = GetActiveJobToServerId(session_key);
-  }
-  if (!active_key) {
-    active_key = mismatched_inflight_key;
-  }
+  struct MismatchResult {
+    int mismatch_count = 0;
+    std::optional<QuicSessionNonReuseReason> reason;
+  };
 
-  if (active_key) {
+  auto analyze_mismatch =
+      [&](const QuicSessionKey& target_key) -> MismatchResult {
+    if (session_key == target_key) {
+      return {0, std::nullopt};
+    }
+
     int mismatch_count = 0;
     std::optional<QuicSessionNonReuseReason> single_mismatch_reason;
 
@@ -1966,45 +1997,157 @@ QuicConnectionReuseDetails QuicSessionPool::DetermineQuicConnectionReuseDetails(
     };
 
     check_mismatch(
-        session_key.socket_tag() != active_key->socket_tag(),
+        session_key.socket_tag() != target_key.socket_tag(),
         QuicSessionNonReuseReason::kNoSessionExisted_KeyMismatch_SocketTag);
     check_mismatch(session_key.network_anonymization_key() !=
-                       active_key->network_anonymization_key(),
+                       target_key.network_anonymization_key(),
                    QuicSessionNonReuseReason::
                        kNoSessionExisted_KeyMismatch_NetworkAnonymizationKey);
     check_mismatch(
-        session_key.privacy_mode() != active_key->privacy_mode(),
+        session_key.privacy_mode() != target_key.privacy_mode(),
         QuicSessionNonReuseReason::kNoSessionExisted_KeyMismatch_PrivacyMode);
     check_mismatch(
-        session_key.secure_dns_policy() != active_key->secure_dns_policy(),
+        session_key.secure_dns_policy() != target_key.secure_dns_policy(),
         QuicSessionNonReuseReason::
             kNoSessionExisted_KeyMismatch_SecureDnsPolicy);
     check_mismatch(
-        session_key.proxy_chain() != active_key->proxy_chain() ||
-            session_key.session_usage() != active_key->session_usage() ||
-            session_key.require_dns_https_alpn() !=
-                active_key->require_dns_https_alpn() ||
-            session_key.disable_cert_verification_network_fetches() !=
-                active_key->disable_cert_verification_network_fetches() ||
-            session_key.target_network() != active_key->target_network(),
+        session_key.proxy_chain() != target_key.proxy_chain(),
+        QuicSessionNonReuseReason::kNoSessionExisted_KeyMismatch_Other);
+    check_mismatch(
+        session_key.session_usage() != target_key.session_usage(),
+        QuicSessionNonReuseReason::kNoSessionExisted_KeyMismatch_Other);
+    check_mismatch(
+        session_key.require_dns_https_alpn() !=
+            target_key.require_dns_https_alpn(),
+        QuicSessionNonReuseReason::kNoSessionExisted_KeyMismatch_Other);
+    check_mismatch(
+        session_key.disable_cert_verification_network_fetches() !=
+            target_key.disable_cert_verification_network_fetches(),
+        QuicSessionNonReuseReason::kNoSessionExisted_KeyMismatch_Other);
+    check_mismatch(
+        session_key.target_network() != target_key.target_network(),
         QuicSessionNonReuseReason::kNoSessionExisted_KeyMismatch_Other);
 
     // If multiple key fields differ, categorize as MultipleFields rather than
     // attributing arbitrarily to a single field.
     if (mismatch_count > 1) {
-      details.non_reuse_reason = QuicSessionNonReuseReason::
-          kNoSessionExisted_KeyMismatch_MultipleFields;
-    } else if (mismatch_count == 1) {
-      details.non_reuse_reason = *single_mismatch_reason;
-    } else {
-      details.non_reuse_reason =
-          QuicSessionNonReuseReason::kNoSessionExisted_KeyMismatch_Other;
+      return {mismatch_count, QuicSessionNonReuseReason::
+                                  kNoSessionExisted_KeyMismatch_MultipleFields};
     }
+    if (mismatch_count == 1) {
+      return {1, *single_mismatch_reason};
+    }
+    // `session_key != target_key` guarantees `mismatch_count >= 1`.
+    NOTREACHED();
+  };
+
+  // Step 2: No exact matching established session existed in `all_sessions_`.
+  // Evaluate candidates targeting `session_key.server_id()` across active
+  // sessions (`active_sessions_`), active jobs (`active_jobs_`), and
+  // handshaking sessions (`all_sessions_`). Select the candidate with the
+  // fewest mismatched key fields, breaking ties in favor of established active
+  // sessions first, and then preconnect over non-preconnect for in-flight
+  // attempts.
+  struct CandidateMatch {
+    int mismatch_count;
+    bool is_established;
+    bool is_preconnect;
+    QuicSessionEstablishmentReason establishment_reason;
+    std::optional<QuicSessionNonReuseReason> non_reuse_reason;
+
+    bool IsBetterThan(const CandidateMatch& other) const {
+      if (mismatch_count != other.mismatch_count) {
+        return mismatch_count < other.mismatch_count;
+      }
+      if (is_established != other.is_established) {
+        return is_established;
+      }
+      if (is_preconnect != other.is_preconnect) {
+        return is_preconnect;
+      }
+      return false;
+    }
+  };
+
+  std::optional<CandidateMatch> best_candidate;
+
+  auto record_candidate = [&](const QuicSessionKey& candidate_key,
+                              bool is_established, bool is_preconnect) {
+    DCHECK(session_key.server_id() == candidate_key.server_id());
+    MismatchResult mismatch = analyze_mismatch(candidate_key);
+    QuicSessionEstablishmentReason establishment_reason;
+    if (is_established) {
+      establishment_reason = QuicSessionEstablishmentReason::kNoSessionExisted;
+    } else if (is_preconnect) {
+      establishment_reason =
+          QuicSessionEstablishmentReason::kInflightSessionAndWasPreconnect;
+    } else {
+      establishment_reason =
+          QuicSessionEstablishmentReason::kInflightSessionButNotPreconnect;
+    }
+
+    CandidateMatch candidate{
+        .mismatch_count = mismatch.mismatch_count,
+        .is_established = is_established,
+        .is_preconnect = is_preconnect,
+        .establishment_reason = establishment_reason,
+        .non_reuse_reason = mismatch.reason,
+    };
+    if (!best_candidate || candidate.IsBetterThan(*best_candidate)) {
+      best_candidate = candidate;
+    }
+  };
+
+  for (const auto& [active_key, session] : active_sessions_) {
+    if (active_key.server_id() == session_key.server_id() &&
+        session_key != active_key) {
+      record_candidate(
+          active_key, /*is_established=*/true,
+          /*is_preconnect=*/session->session_creation_initiator() ==
+              MultiplexedSessionCreationInitiator::kPreconnect);
+    }
+  }
+
+  for (const auto& [job_key, job] : active_jobs_) {
+    CHECK(job);
+    if (job_key.server_id() == session_key.server_id()) {
+      record_candidate(job_key, /*is_established=*/false,
+                       /*is_preconnect=*/job->session_creation_initiator() ==
+                           MultiplexedSessionCreationInitiator::kPreconnect);
+    }
+  }
+
+  // Also check `all_sessions_` for sessions still in the process of
+  // handshaking (e.g. when attempts are managed via QuicSessionAttemptManager
+  // under HEv3 / HttpStreamPool). Check O(1) connection liveness and server_id
+  // match before calling `IsSessionActive()` (which performs a linear scan over
+  // `active_sessions_`).
+  // Note: If multiple handshaking sessions in `all_sessions_` tie on
+  // `mismatch_count` and `is_preconnect` but differ in which field mismatches,
+  // the reported `non_reuse_reason` retains the first encountered candidate
+  // (arbitrarily determined by pointer address order in `all_sessions_`).
+  for (const auto& session : all_sessions_) {
+    if (session->server_id() == session_key.server_id() &&
+        !session->OneRttKeysAvailable() && !session->goaway_received() &&
+        session->connection() && session->connection()->connected() &&
+        !IsSessionActive(session.get())) {
+      record_candidate(
+          session->quic_session_key(), /*is_established=*/false,
+          /*is_preconnect=*/session->session_creation_initiator() ==
+              MultiplexedSessionCreationInitiator::kPreconnect);
+    }
+  }
+
+  if (best_candidate) {
+    details.establishment_reason = best_candidate->establishment_reason;
+    details.non_reuse_reason = best_candidate->non_reuse_reason;
     return details;
   }
 
   // Step 3: No active session or job exists for this server at all (cold
   // start).
+  details.establishment_reason =
+      QuicSessionEstablishmentReason::kNoSessionExisted;
   details.non_reuse_reason =
       QuicSessionNonReuseReason::kNoSessionExisted_TrueColdStart;
   return details;
@@ -2107,18 +2250,23 @@ int QuicSessionPool::CreateSessionAsync(
   std::unique_ptr<DatagramClientSocket> socket(CreateSocket(
       key.session_key().target_network(), net_log.net_log(), net_log.source()));
   DatagramClientSocket* socket_ptr = socket.get();
-  CompletionOnceCallback connect_and_configure_callback = base::BindOnce(
-      &QuicSessionPool::FinishCreateSession, weak_factory_.GetWeakPtr(),
-      std::move(callback), std::move(key), quic_version, cert_verify_flags,
-      require_confirmation, peer_address, std::move(metadata),
-      dns_resolution_start_time, dns_resolution_end_time,
-      std::move(resolution_details),
-      /*session_max_packet_length=*/0, net_log,
-      // TODO(crbug.com/518753285): Stop setting the network that should be used
-      // due to connection migration via ConnectAndConfigureSocket. Instead,
-      // rely on the new parameter in `CreateSocket`.
-      network, std::move(socket), session_creation_initiator,
-      quic_connection_reuse_details, connection_management_config);
+  ConnectAndConfigureCallback connect_and_configure_callback = base::BindOnce(
+      [](CompletionOnceCallback cb, int rv,
+         std::optional<QuicSocketConfigStep> /*error_step*/) {
+        std::move(cb).Run(rv);
+      },
+      base::BindOnce(
+          &QuicSessionPool::FinishCreateSession, weak_factory_.GetWeakPtr(),
+          std::move(callback), std::move(key), quic_version, cert_verify_flags,
+          require_confirmation, peer_address, std::move(metadata),
+          dns_resolution_start_time, dns_resolution_end_time,
+          std::move(resolution_details),
+          /*session_max_packet_length=*/0, net_log,
+          // TODO(crbug.com/518753285): Stop setting the network that should be
+          // used due to connection migration via ConnectAndConfigureSocket.
+          // Instead, rely on the new parameter in `CreateSocket`.
+          network, std::move(socket), session_creation_initiator,
+          quic_connection_reuse_details, connection_management_config));
 
   // If migrate_sessions_on_network_change_v2 is on, passing in
   // handles::kInvalidNetworkHandle will bind the socket to the default network.
@@ -2361,18 +2509,31 @@ QuicSessionPool::CreateSessionHelper(
   bool enabled_connection_keep_alive = false;
   if (connection_management_config.has_value() &&
       connection_management_config->keep_alive_config.has_value()) {
-    config.SetIdleNetworkTimeout(quic::QuicTime::Delta::FromSeconds(
-        connection_management_config->keep_alive_config
-            ->idle_timeout_in_seconds));
-    config.AddConnectionOptionsToSend(
-        quic::ParseQuicTagVector(connection_management_config->keep_alive_config
-                                     ->quic_connection_options));
-    keep_alive_timeout = quic::QuicTime::Delta::FromSeconds(
-        connection_management_config->keep_alive_config
-            ->ping_interval_in_seconds);
+    const auto& keep_alive_config =
+        connection_management_config->keep_alive_config.value();
+    if (keep_alive_config.idle_timeout.is_positive()) {
+      config.SetIdleNetworkTimeout(quic::QuicTime::Delta::FromMicroseconds(
+          keep_alive_config.idle_timeout.InMicroseconds()));
+    }
+    if (!keep_alive_config.quic_connection_options.empty()) {
+      config.AddConnectionOptionsToSend(
+          quic::ParseQuicTagVector(keep_alive_config.quic_connection_options));
+    }
+    if (keep_alive_config.ping_interval.is_positive()) {
+      keep_alive_timeout = quic::QuicTime::Delta::FromMicroseconds(
+          keep_alive_config.ping_interval.InMicroseconds());
+    }
     enabled_connection_keep_alive =
-        connection_management_config->keep_alive_config
-            ->enable_connection_keep_alive;
+        keep_alive_config.enable_connection_keep_alive;
+    // Set the initial RTT locally on the client connection to avoid advertising
+    // a synthetic `IRTT` transport parameter to the server.
+    if (keep_alive_config.initial_rtt.is_positive() &&
+        !config.HasInitialRoundTripTimeUsToSend()) {
+      connection->sent_packet_manager().SetInitialRtt(
+          quic::QuicTime::Delta::FromMicroseconds(
+              keep_alive_config.initial_rtt.InMicroseconds()),
+          /*trusted=*/false);
+    }
   }
   connection->set_keep_alive_ping_timeout(keep_alive_timeout);
 
@@ -2750,9 +2911,7 @@ void QuicSessionPool::UnmapSessionFromSessionAliases(
 
 std::unique_ptr<QuicSessionPool::CryptoClientConfigHandle>
 QuicSessionPool::CreateCryptoConfigHandle(QuicCryptoClientConfigKey key) {
-  if (!use_network_anonymization_key_for_crypto_configs_) {
-    key.network_anonymization_key = NetworkAnonymizationKey();
-  }
+  NormalizeCryptoConfigKey(key);
 
   // If there's a matching entry in |active_crypto_config_map_|, create a
   // CryptoClientConfigHandle for it.
@@ -2826,8 +2985,12 @@ QuicSessionPool::CreateCryptoConfigHandle(QuicCryptoClientConfigKey key) {
 void QuicSessionPool::OnAllCryptoClientRefReleased(
     QuicCryptoClientConfigMap::iterator& map_iterator) {
   DCHECK_EQ(0, map_iterator->second->num_refs());
-  recent_crypto_config_map_.Put(map_iterator->first,
-                                std::move(map_iterator->second));
+  DCHECK(!map_iterator->first.ssl_config_generation.is_null());
+  // Don't stash the config if it was created under a previous SSLContextConfig.
+  if (map_iterator->first.ssl_config_generation == ssl_config_generation_) {
+    recent_crypto_config_map_.Put(map_iterator->first,
+                                  std::move(map_iterator->second));
+  }
   active_crypto_config_map_.erase(map_iterator);
 }
 
@@ -2866,6 +3029,14 @@ void QuicSessionPool::CheckQuicSessionKeyMismatch(
                                 destination, session_key, active_key));
 }
 
+void QuicSessionPool::NormalizeCryptoConfigKey(
+    QuicCryptoClientConfigKey& key) const {
+  if (!use_network_anonymization_key_for_crypto_configs_) {
+    key.network_anonymization_key = NetworkAnonymizationKey();
+  }
+  key.ssl_config_generation = ssl_config_generation_;
+}
+
 std::unique_ptr<QuicCryptoClientConfigHandle>
 QuicSessionPool::GetCryptoConfigForTesting(QuicCryptoClientConfigKey key) {
   return CreateCryptoConfigHandle(std::move(key));
@@ -2875,9 +3046,7 @@ bool QuicSessionPool::CryptoConfigCacheIsEmptyForTesting(
     const quic::QuicServerId& server_id,
     QuicCryptoClientConfigKey key) {
   quic::QuicCryptoClientConfig::CachedState* cached = nullptr;
-  if (!use_network_anonymization_key_for_crypto_configs_) {
-    key.network_anonymization_key = NetworkAnonymizationKey();
-  }
+  NormalizeCryptoConfigKey(key);
   auto map_iterator = active_crypto_config_map_.find(key);
   if (map_iterator != active_crypto_config_map_.end()) {
     cached = map_iterator->second->config()->LookupOrCreate(server_id);
@@ -2892,9 +3061,7 @@ bool QuicSessionPool::CryptoConfigCacheIsEmptyForTesting(
 
 bool QuicSessionPool::CryptoConfigSessionCacheIsEmptyForTesting(
     QuicCryptoClientConfigKey key) {
-  if (!use_network_anonymization_key_for_crypto_configs_) {
-    key.network_anonymization_key = NetworkAnonymizationKey();
-  }
+  NormalizeCryptoConfigKey(key);
   quic::QuicCryptoClientConfig* config = nullptr;
   auto map_iterator = active_crypto_config_map_.find(key);
   if (map_iterator != active_crypto_config_map_.end()) {

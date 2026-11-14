@@ -10,11 +10,10 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 
-#include "absl/base/casts.h"
 #include "absl/base/nullability.h"
 #include "absl/container/flat_hash_set.h"
-#include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "quiche/quic/core/quic_alarm.h"
@@ -22,16 +21,12 @@
 #include "quiche/quic/core/quic_time.h"
 #include "quiche/quic/moqt/moqt_bidi_stream.h"
 #include "quiche/quic/moqt/moqt_error.h"
-#include "quiche/quic/moqt/moqt_fetch_task.h"
-#include "quiche/quic/moqt/moqt_key_value_pair.h"
 #include "quiche/quic/moqt/moqt_live_publisher.h"
 #include "quiche/quic/moqt/moqt_messages.h"
-#include "quiche/quic/moqt/moqt_names.h"
 #include "quiche/quic/moqt/moqt_object_subscriber.h"
 #include "quiche/quic/moqt/moqt_parser.h"
 #include "quiche/quic/moqt/moqt_session.h"
 #include "quiche/quic/moqt/moqt_session_interface.h"
-#include "quiche/quic/moqt/moqt_types.h"
 #include "quiche/quic/moqt/moqt_uni_stream.h"
 #include "quiche/quic/moqt/test_tools/moqt_framer_utils.h"
 #include "quiche/common/platform/api/quiche_logging.h"
@@ -161,25 +156,13 @@ class MoqtSessionPeer {
     session->next_request_id_ = id;
   }
 
-  static void set_peer_max_request_id(MoqtSession* session, uint64_t id) {
-    session->peer_max_request_id_ = id;
-  }
-
   static void set_peer_setup_received(MoqtSession* session, bool value) {
     session->peer_setup_received_ = value;
   }
 
-  static MoqtSession::PublishedFetch* GetFetch(MoqtSession* session,
-                                               uint64_t fetch_id) {
-    auto it = session->incoming_fetches_.find(fetch_id);
-    if (it == session->incoming_fetches_.end()) {
-      return nullptr;
-    }
-    return it->second.get();
-  }
-
-  static void ValidateRequestId(MoqtSession* session, uint64_t id) {
-    session->ValidateRequestId(id);
+  static absl::Status ValidateNewIncomingRequestId(MoqtSession* session,
+                                                   uint64_t id) {
+    return session->ValidateNewIncomingRequestId(id);
   }
 
   static quic::QuicAlarmFactory* GetAlarmFactory(MoqtSession* session) {
@@ -198,13 +181,22 @@ class MoqtSessionPeer {
     return session->goaway_timeout_alarm_.get();
   }
 
-  static quic::QuicTimeDelta GetDeliveryTimeout(MoqtSession* session,
-                                                uint64_t request_id) {
+  static quic::QuicTimeDelta GetObjectDeliveryTimeout(MoqtSession* session,
+                                                      uint64_t request_id) {
     auto it = session->published_subscriptions_.find(request_id);
     if (it == session->published_subscriptions_.end()) {
       return quic::QuicTimeDelta::Zero();
     }
-    return it->second->delivery_timeout();
+    return it->second->object_delivery_timeout();
+  }
+
+  static quic::QuicTimeDelta GetSubgroupDeliveryTimeout(MoqtSession* session,
+                                                        uint64_t request_id) {
+    auto it = session->published_subscriptions_.find(request_id);
+    if (it == session->published_subscriptions_.end()) {
+      return quic::QuicTimeDelta::Zero();
+    }
+    return it->second->subgroup_delivery_timeout();
   }
 
   static absl::string_view GetImplementationString(MoqtSession* session) {
@@ -228,11 +220,18 @@ class MoqtSessionPeer {
     return session->parameters_;
   }
 
-  static std::optional<uint64_t> NextQueuedRequestIdToServer(
+  static std::optional<uint64_t> NextQueuedStreamIdToServer(
       MoqtSession* session) {
-    return session->subscriptions_with_queued_streams_.empty()
-               ? std::optional<uint64_t>()
-               : session->subscriptions_with_queued_streams_.begin()->second;
+    if (session->requests_with_queued_streams_.empty()) {
+      return std::nullopt;
+    }
+    for (const auto& [priority, target] :
+         session->requests_with_queued_streams_) {
+      if (std::holds_alternative<webtransport::StreamId>(target)) {
+        return std::get<webtransport::StreamId>(target);
+      }
+    }
+    return std::nullopt;
   }
 
   static uint64_t GetLastTrackAlias(MoqtSession* session) {

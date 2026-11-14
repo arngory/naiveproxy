@@ -1859,11 +1859,14 @@ message AndroidJankCujMetric {
 // Begin of protos/perfetto/metrics/android/java_heap_class_stats.proto
 
 message JavaHeapClassStats {
-  // Next id: 13
+  // Next id: 16
   message TypeCount {
     reserved 11;
     optional string type_name = 1;
-    optional bool is_libcore_or_array = 12;
+    optional bool is_libcore_or_array = 12 [deprecated = true];
+    optional bool is_language_runtime = 13;
+    optional bool is_container = 14;
+    optional bool is_static_class = 15;
 
     optional int64 obj_count = 2;
     optional int64 size_bytes = 3;
@@ -3293,7 +3296,7 @@ message CloneDuration {
 // Begin of protos/perfetto/metrics/metrics.proto
 
 // Trace processor metadata
-// Next id: 21
+// Next id: 22
 message TraceMetadata {
   reserved 1;
   optional int64 trace_duration_ns = 2;
@@ -3315,6 +3318,7 @@ message TraceMetadata {
   optional int64 suspend_count = 13;
   optional int64 data_loss_count = 14;
   optional int64 error_count = 15;
+  optional string trace_recovery_reason = 21;
 }
 
 // Stats counters for the trace.

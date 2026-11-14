@@ -4,6 +4,9 @@
 
 package org.jni_zero;
 
+import org.jni_zero.JniZero.SafePointersTracker;
+import org.jni_zero.internal.Nullable;
+
 /**
  * Implementation of {@link JniUniquePtr} representing an owned C++ object.
  *
@@ -12,12 +15,19 @@ package org.jni_zero;
  */
 class JniUniquePtrImpl<T extends JniTypeToken> implements JniUniquePtr<T>, JniPtrInner<T> {
     private final long mDeleter;
+    private final @Nullable SafePointersTracker mTracker;
     private long mNativePointer;
 
     JniUniquePtrImpl(long nativePointer, long deleter) {
+        this(nativePointer, deleter, null);
+    }
+
+    @CalledByNative
+    JniUniquePtrImpl(long nativePointer, long deleter, @Nullable String creationContext) {
         assert nativePointer != 0;
         mNativePointer = nativePointer;
         mDeleter = deleter;
+        mTracker = JniZero.createSafePointersTracker(this, creationContext);
     }
 
     @Override
@@ -33,6 +43,9 @@ class JniUniquePtrImpl<T extends JniTypeToken> implements JniUniquePtr<T>, JniPt
     @Override
     public void destroy() {
         if (mNativePointer != 0) {
+            if (mTracker != null) {
+                mTracker.destroy();
+            }
             long ptr = mNativePointer;
             mNativePointer = 0;
             if (mDeleter != 0) {

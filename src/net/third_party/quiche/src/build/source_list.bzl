@@ -9,6 +9,7 @@ protobuf_test_support = [
     "quic/test_tools/send_algorithm_test_result.proto",
 ]
 quiche_core_hdrs = [
+    "common/abiding_object_pool.h",
     "common/btree_scheduler.h",
     "common/bug_utils.h",
     "common/bug_utils_test_helper.h",
@@ -64,6 +65,7 @@ quiche_core_hdrs = [
     "common/quiche_status_utils.h",
     "common/quiche_string_tuple.h",
     "common/quiche_text_utils.h",
+    "common/quiche_types.h",
     "common/quiche_weak_ptr.h",
     "common/simple_buffer_allocator.h",
     "common/stable_block_list.h",
@@ -1129,6 +1131,7 @@ quiche_tests_srcs = [
     "balsa/header_properties_test.cc",
     "balsa/simple_buffer_test.cc",
     "binary_http/binary_http_message_test.cc",
+    "common/abiding_object_pool_test.cc",
     "common/btree_scheduler_test.cc",
     "common/bug_utils_test.cc",
     "common/capsule_test.cc",
@@ -1313,6 +1316,7 @@ quiche_tests_srcs = [
     "quic/core/http/quic_spdy_stream_test.cc",
     "quic/core/http/spdy_utils_test.cc",
     "quic/core/http/web_transport_http3_test.cc",
+    "quic/core/http/web_transport_stream_adapter_test.cc",
     "quic/core/legacy_quic_stream_id_manager_test.cc",
     "quic/core/packet_number_indexed_queue_test.cc",
     "quic/core/qpack/new_qpack_blocking_manager_test.cc",
@@ -1501,7 +1505,6 @@ nghttp2_srcs = [
     "http2/adapter/nghttp2_callbacks.cc",
     "http2/adapter/nghttp2_data_provider.cc",
     "http2/adapter/nghttp2_session.cc",
-    "http2/adapter/nghttp2_test.cc",
     "http2/adapter/nghttp2_util.cc",
 ]
 nghttp2_test_support_hdrs = [
@@ -1520,6 +1523,7 @@ nghttp2_tests_srcs = [
     "http2/adapter/nghttp2_adapter_test.cc",
     "http2/adapter/nghttp2_data_provider_test.cc",
     "http2/adapter/nghttp2_session_test.cc",
+    "http2/adapter/nghttp2_test.cc",
 ]
 default_platform_impl_hdrs = [
     "common/platform/default/quiche_platform_impl/quiche_bug_tracker_impl.h",
@@ -1573,30 +1577,39 @@ default_platform_impl_test_support_srcs = [
     "common/platform/default/quiche_platform_impl/quiche_test_impl.cc",
     "common/platform/default/quiche_platform_impl/quiche_test_loopback_impl.cc",
 ]
+load_balancer_test_hdrs = [
+]
+load_balancer_test_srcs = [
+    "quic/load_balancer/load_balancer_config_test.cc",
+    "quic/load_balancer/load_balancer_decoder_test.cc",
+    "quic/load_balancer/load_balancer_encoder_test.cc",
+    "quic/load_balancer/load_balancer_server_id_map_test.cc",
+    "quic/load_balancer/load_balancer_server_id_test.cc",
+]
+load_balancer_test_support_hdrs = [
+    "quic/test_tools/mock_load_balancer_encoder.h",
+]
+load_balancer_test_support_srcs = [
+]
 load_balancer_hdrs = [
     "quic/load_balancer/load_balancer_config.h",
     "quic/load_balancer/load_balancer_decoder.h",
     "quic/load_balancer/load_balancer_encoder.h",
     "quic/load_balancer/load_balancer_server_id.h",
     "quic/load_balancer/load_balancer_server_id_map.h",
-    "quic/test_tools/mock_load_balancer_encoder.h",
 ]
 load_balancer_srcs = [
     "quic/load_balancer/load_balancer_config.cc",
-    "quic/load_balancer/load_balancer_config_test.cc",
     "quic/load_balancer/load_balancer_decoder.cc",
-    "quic/load_balancer/load_balancer_decoder_test.cc",
     "quic/load_balancer/load_balancer_encoder.cc",
-    "quic/load_balancer/load_balancer_encoder_test.cc",
     "quic/load_balancer/load_balancer_server_id.cc",
-    "quic/load_balancer/load_balancer_server_id_map_test.cc",
-    "quic/load_balancer/load_balancer_server_id_test.cc",
 ]
 moqt_hdrs = [
     "quic/moqt/moqt_bidi_stream.h",
     "quic/moqt/moqt_bitrate_adjuster.h",
     "quic/moqt/moqt_control_message_queue.h",
     "quic/moqt/moqt_error.h",
+    "quic/moqt/moqt_fetch_stream.h",
     "quic/moqt/moqt_fetch_task.h",
     "quic/moqt/moqt_framer.h",
     "quic/moqt/moqt_key_value_pair.h",
@@ -1641,6 +1654,7 @@ moqt_srcs = [
     "quic/moqt/moqt_bitrate_adjuster.cc",
     "quic/moqt/moqt_control_message_queue.cc",
     "quic/moqt/moqt_error.cc",
+    "quic/moqt/moqt_fetch_stream.cc",
     "quic/moqt/moqt_framer.cc",
     "quic/moqt/moqt_key_value_pair.cc",
     "quic/moqt/moqt_known_track_publisher.cc",
@@ -1680,6 +1694,7 @@ moqt_test_srcs = [
     "quic/moqt/moqt_bidi_stream_test.cc",
     "quic/moqt/moqt_bitrate_adjuster_test.cc",
     "quic/moqt/moqt_control_message_queue_test.cc",
+    "quic/moqt/moqt_fetch_stream_test.cc",
     "quic/moqt/moqt_framer_test.cc",
     "quic/moqt/moqt_integration_test.cc",
     "quic/moqt/moqt_key_value_pair_test.cc",

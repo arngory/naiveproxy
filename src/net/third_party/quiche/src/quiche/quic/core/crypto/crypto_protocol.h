@@ -381,6 +381,7 @@ DEFINE_STATIC_QUIC_TAG(CIDT);  // Check the idle timeout on the client before
 
 DEFINE_STATIC_QUIC_TAG(3AFF);  // 3 anti amplification factor.
 DEFINE_STATIC_QUIC_TAG(5AFF);  // 5 anti amplification factor.
+DEFINE_STATIC_QUIC_TAG(8AFF);  // 8 anti amplification factor.
 DEFINE_STATIC_QUIC_TAG(10AF);  // 10 anti amplification factor.
 
 // Enable path MTU discovery experiment.
@@ -513,6 +514,8 @@ DEFINE_STATIC_QUIC_TAG(PAD);  // Padding
 // Client Hello Padding tags, for experiments.
 DEFINE_STATIC_QUIC_TAG(CHP1);  // 1-packet padding to CHLO.
 DEFINE_STATIC_QUIC_TAG(CHP2);  // 2-packet padding to CHLO.
+DEFINE_STATIC_QUIC_TAG(BCFR);  // Bundle CRYPTO frames when retransmitting.
+DEFINE_STATIC_QUIC_TAG(SAOW);  // Send ACKs after OnCanWrite.
 
 // Stats collection tags
 DEFINE_STATIC_QUIC_TAG(EPID);  // Endpoint identifier.
@@ -551,6 +554,11 @@ DEFINE_STATIC_QUIC_TAG(CFLS);  // Enable flow-label-based blackhole avoidance on
 
 // Explicit connection close packet for max age timeout from server.
 DEFINE_STATIC_QUIC_TAG(ECCP);  // Deprecated and Default Enabled.
+
+// Active connection ID limit experiments.
+DEFINE_STATIC_QUIC_TAG(3CID);  // Send active_connection_id_limit of 3.
+DEFINE_STATIC_QUIC_TAG(4CID);  // Send active_connection_id_limit of 4.
+DEFINE_STATIC_QUIC_TAG(5CID);  // Send active_connection_id_limit of 5.
 
 #undef DEFINE_STATIC_QUIC_TAG
 
