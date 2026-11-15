@@ -526,17 +526,96 @@ TrustStoreWin* GetGlobalTrustStoreWinForCRS() {
 void InitializeTrustStoreForCRSOnWorkerThread() {
   GetGlobalTrustStoreWinForCRS()->InitializeStores();
 }
+
+// naive: as on Android, the roots added to Windows' own stores are not trusted
+// by default: an embedder trusts beside the Chrome Root Store only the PEM file
+// SSL_CERT_FILE names, or the Windows stores when CRONET_WINDOWS_SYSTEM_ROOTS
+// is 1. Both are read when an engine's verifier is made, so a change counts
+// from the next engine. Roots from either are local trust anchors: QUIC takes
+// them only with allow_unknown_cert_roots.
+constexpr char kStaticCertFileEnv[] = "SSL_CERT_FILE";
+constexpr char kWindowsSystemRootsEnv[] = "CRONET_WINDOWS_SYSTEM_ROOTS";
+
+bool UseWindowsSystemRoots() {
+  std::optional<std::string> value =
+      base::Environment::Create()->GetVar(kWindowsSystemRootsEnv);
+  return value.has_value() && *value == "1";
+}
+
+class TrustStoreCertFile : public PlatformTrustStore {
+ public:
+  TrustStoreCertFile() {
+    std::optional<std::string> filename =
+        base::Environment::Create()->GetVar(kStaticCertFileEnv);
+    if (!filename.has_value() || filename->empty()) {
+      return;
+    }
+    std::string file;
+    if (!base::ReadFileToString(base::FilePath::FromUTF8Unsafe(*filename),
+                                &file)) {
+      VLOG(1) << "SSL_CERT_FILE could not be read";
+      return;
+    }
+    CertificateList certs = X509Certificate::CreateCertificateListFromBytes(
+        base::as_byte_span(file), X509Certificate::FORMAT_AUTO);
+    for (const auto& cert : certs) {
+      bssl::CertErrors errors;
+      auto parsed = bssl::ParsedCertificate::Create(
+          bssl::UpRef(cert->cert_buffer()),
+          x509_util::DefaultParseCertificateOptions(), &errors);
+      if (!parsed) {
+        LOG(ERROR) << errors.ToDebugString();
+        continue;
+      }
+      if (!trust_store_.Contains(parsed.get())) {
+        trust_store_.AddTrustAnchor(parsed);
+      }
+    }
+  }
+
+  TrustStoreCertFile(const TrustStoreCertFile&) = delete;
+  TrustStoreCertFile& operator=(const TrustStoreCertFile&) = delete;
+
+  // bssl::CertIssuerSource implementation:
+  void SyncGetIssuersOf(const bssl::ParsedCertificate* cert,
+                        bssl::ParsedCertificateList* issuers) override {
+    trust_store_.SyncGetIssuersOf(cert, issuers);
+  }
+
+  // bssl::TrustStore implementation:
+  bssl::CertificateTrust GetTrust(
+      const bssl::ParsedCertificate* cert) override {
+    return trust_store_.GetTrust(cert);
+  }
+
+  // net::PlatformTrustStore implementation:
+  std::vector<net::PlatformTrustStore::CertWithTrust> GetAllUserAddedCerts()
+      override {
+    return {};
+  }
+
+ private:
+  bssl::TrustStoreInMemory trust_store_;
+};
 }  // namespace
 
 std::unique_ptr<SystemTrustStore> CreateSslSystemTrustStoreChromeRoot(
     std::unique_ptr<TrustStoreChrome> chrome_root) {
-  return std::make_unique<SystemTrustStoreChromeWithUnOwnedSystemStore>(
-      std::move(chrome_root), GetGlobalTrustStoreWinForCRS());
+  if (UseWindowsSystemRoots()) {
+    return std::make_unique<SystemTrustStoreChromeWithUnOwnedSystemStore>(
+        std::move(chrome_root), GetGlobalTrustStoreWinForCRS());
+  }
+  return std::make_unique<SystemTrustStoreChrome>(
+      std::move(chrome_root), std::make_unique<TrustStoreCertFile>());
 }
 
 // We do this in a separate thread as loading the Windows Cert Stores can cause
-// quite a bit of I/O. See crbug.com/1399974 for more context.
+// quite a bit of I/O. See crbug.com/1399974 for more context. naive: only when
+// the embedder asks for the Windows stores.
 void InitializeTrustStoreWinSystem() {
+  if (!UseWindowsSystemRoots()) {
+    return;
+  }
   base::ThreadPool::PostTask(
       FROM_HERE,
       {base::MayBlock(), base::TaskShutdownBehavior::CONTINUE_ON_SHUTDOWN},
