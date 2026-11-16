@@ -264,6 +264,9 @@ class NET_EXPORT_PRIVATE QuicChromiumClientStream
     bool is_first_stream_;
     // The stream reads its body as capsules (an HTTP/3 datagram visitor).
     bool uses_capsules_ = false;
+    // The stream used capsules, and closed after its read side reached the FIN
+    // with no stream error.
+    bool clean_capsule_end_ = false;
     size_t num_bytes_consumed_;
     Idempotency idempotency_ = DEFAULT_IDEMPOTENCY;
 

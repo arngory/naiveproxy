@@ -168,6 +168,13 @@ void QuicChromiumClientStream::Handle::OnError(int error) {
   net_error_ = error;
   if (stream_) {
     SaveState();
+    // A server that ends a capsule stream cleanly also sends STOP_SENDING, so
+    // the stream closes with no FIN sent: its read side reaching the FIN with
+    // no stream error is the clean end. A capsule that does not parse, a
+    // STOP_SENDING or reset with an error code, or a connection closed with an
+    // error, set a stream error.
+    clean_capsule_end_ = uses_capsules_ && is_done_reading_ &&
+                         stream_error_ == quic::QUIC_STREAM_NO_ERROR;
     if (uses_capsules_ && stream_->initial_headers_arrived_ &&
         !stream_->headers_delivered_) {
       initial_headers_after_close_rv_ =
@@ -207,11 +214,9 @@ void QuicChromiumClientStream::Handle::InvokeCallbacksOnClose(int error) {
       return;
     }
   }
-  // With capsules, a read side that reached its FIN has no more to read
-  // however the write side ended (a server closing cleanly also sends
-  // STOP_SENDING): the end of the body is EOF, as ReadBody() returns it, and
-  // no trailers come, as OnFinRead() would have it.
-  if (uses_capsules_ && is_done_reading_) {
+  // The clean end of a capsule stream is the end of the body: EOF, as
+  // ReadBody() returns it, and no trailers, as OnFinRead() would have it.
+  if (clean_capsule_end_) {
     read_headers_callback_.Reset();
     if (read_body_callback_) {
       ResetAndRun(std::move(read_body_callback_), OK);
@@ -263,6 +268,12 @@ int QuicChromiumClientStream::Handle::ReadBody(
     int buffer_len,
     CompletionOnceCallback callback) {
   ScopedBoolSaver saver(&may_invoke_callbacks_, false);
+  // A capsule stream that closed with an error ends with it, even though its
+  // read side reached the FIN.
+  if (!stream_ && uses_capsules_ && !clean_capsule_end_) {
+    return net_error_;
+  }
+
   if (IsDoneReading())
     return OK;
 
