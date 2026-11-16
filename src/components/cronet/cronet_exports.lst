@@ -8,6 +8,7 @@
   global:
     Cronet_*;
     bidirectional_stream_*;
+    datagram_stream_*;
   local:
     *;
 };
