@@ -232,6 +232,13 @@ class NET_EXPORT_PRIVATE QuicChromiumClientStream
     // Provided by the owner of this handle when ReadInitialHeaders is called.
     raw_ptr<quiche::HttpHeaderBlock> read_headers_buffer_ = nullptr;
 
+    // Initial headers that arrived before the stream closed but were not
+    // delivered yet, and the result of reading them; ERR_IO_PENDING if none.
+    // With an HTTP/3 datagram visitor the stream can close as soon as the
+    // response arrives, before the posted OnInitialHeadersAvailable().
+    quiche::HttpHeaderBlock initial_headers_after_close_;
+    int initial_headers_after_close_rv_ = ERR_IO_PENDING;
+
     // Callback to be invoked when ReadBody completes asynchronously.
     CompletionOnceCallback read_body_callback_;
     scoped_refptr<IOBuffer> read_body_buffer_;

@@ -159,8 +159,13 @@ void QuicChromiumClientStream::Handle::OnClose() {
 void QuicChromiumClientStream::Handle::OnError(int error) {
   net_error_ = error;
   UnregisterHttp3DatagramVisitor();
-  if (stream_)
+  if (stream_) {
     SaveState();
+    if (stream_->initial_headers_arrived_ && !stream_->headers_delivered_) {
+      initial_headers_after_close_rv_ =
+          stream_->DeliverInitialHeaders(&initial_headers_after_close_);
+    }
+  }
   stream_ = nullptr;
 
   // Post a task to invoke the callbacks to ensure that there is no reentrancy.
@@ -183,6 +188,16 @@ void QuicChromiumClientStream::Handle::InvokeCallbacksOnClose(int error) {
   read_body_buffer_len_ = 0;
 
   auto guard(weak_factory_.GetWeakPtr());
+  // Headers that arrived before the close are read before the error.
+  if (read_headers_callback_ &&
+      initial_headers_after_close_rv_ != ERR_IO_PENDING) {
+    *read_headers_buffer_ = std::move(initial_headers_after_close_);
+    ResetAndRun(std::move(read_headers_callback_),
+                std::exchange(initial_headers_after_close_rv_, ERR_IO_PENDING));
+    if (!guard.get()) {
+      return;
+    }
+  }
   for (auto* callback :
        {&read_headers_callback_, &read_body_callback_, &write_callback_}) {
     if (*callback)
@@ -196,8 +211,13 @@ int QuicChromiumClientStream::Handle::ReadInitialHeaders(
     quiche::HttpHeaderBlock* header_block,
     CompletionOnceCallback callback) {
   ScopedBoolSaver saver(&may_invoke_callbacks_, false);
-  if (!stream_)
+  if (!stream_) {
+    if (initial_headers_after_close_rv_ != ERR_IO_PENDING) {
+      *header_block = std::move(initial_headers_after_close_);
+      return std::exchange(initial_headers_after_close_rv_, ERR_IO_PENDING);
+    }
     return net_error_;
+  }
 
   // Check Early Hints first.
   int rv = stream_->DeliverEarlyHints(header_block);
