@@ -232,9 +232,9 @@ class NET_EXPORT_PRIVATE QuicChromiumClientStream
     // Provided by the owner of this handle when ReadInitialHeaders is called.
     raw_ptr<quiche::HttpHeaderBlock> read_headers_buffer_ = nullptr;
 
-    // Initial headers that arrived before the stream closed but were not
-    // delivered yet, and the result of reading them; ERR_IO_PENDING if none.
-    // With an HTTP/3 datagram visitor the stream can close as soon as the
+    // Initial headers that arrived before a stream with an HTTP/3 datagram
+    // visitor closed but were not delivered yet, and the result of reading
+    // them; ERR_IO_PENDING if none. Such a stream can close as soon as the
     // response arrives, before the posted OnInitialHeadersAvailable().
     quiche::HttpHeaderBlock initial_headers_after_close_;
     int initial_headers_after_close_rv_ = ERR_IO_PENDING;
@@ -261,6 +261,8 @@ class NET_EXPORT_PRIVATE QuicChromiumClientStream
     uint64_t stream_bytes_written_;
     bool is_done_reading_;
     bool is_first_stream_;
+    // The stream reads its body as capsules (an HTTP/3 datagram visitor).
+    bool uses_capsules_ = false;
     size_t num_bytes_consumed_;
     Idempotency idempotency_ = DEFAULT_IDEMPOTENCY;
 

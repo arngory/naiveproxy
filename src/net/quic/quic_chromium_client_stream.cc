@@ -158,14 +158,15 @@ void QuicChromiumClientStream::Handle::OnClose() {
 
 void QuicChromiumClientStream::Handle::OnError(int error) {
   net_error_ = error;
-  UnregisterHttp3DatagramVisitor();
   if (stream_) {
     SaveState();
-    if (stream_->initial_headers_arrived_ && !stream_->headers_delivered_) {
+    if (uses_capsules_ && stream_->initial_headers_arrived_ &&
+        !stream_->headers_delivered_) {
       initial_headers_after_close_rv_ =
           stream_->DeliverInitialHeaders(&initial_headers_after_close_);
     }
   }
+  UnregisterHttp3DatagramVisitor();
   stream_ = nullptr;
 
   // Post a task to invoke the callbacks to ensure that there is no reentrancy.
@@ -196,6 +197,19 @@ void QuicChromiumClientStream::Handle::InvokeCallbacksOnClose(int error) {
                 std::exchange(initial_headers_after_close_rv_, ERR_IO_PENDING));
     if (!guard.get()) {
       return;
+    }
+  }
+  // With capsules, a read side that reached its FIN has no more to read
+  // however the write side ended (a server closing cleanly also sends
+  // STOP_SENDING): the end of the body is EOF, as ReadBody() returns it, and
+  // no trailers come, as OnFinRead() would have it.
+  if (uses_capsules_ && is_done_reading_) {
+    read_headers_callback_.Reset();
+    if (read_body_callback_) {
+      ResetAndRun(std::move(read_body_callback_), OK);
+      if (!guard.get()) {
+        return;
+      }
     }
   }
   for (auto* callback :
@@ -377,6 +391,11 @@ int QuicChromiumClientStream::Handle::SendHttp3Datagram(
   if (!stream_->SupportsH3Datagram()) {
     return ERR_NOT_IMPLEMENTED;
   }
+  // The write side was reset, as after a STOP_SENDING: what is sent goes
+  // nowhere.
+  if (stream_->write_side_closed()) {
+    return ERR_CONNECTION_CLOSED;
+  }
   switch (stream_->SendHttp3Datagram(payload)) {
     case quic::DATAGRAM_STATUS_SUCCESS:
     case quic::DATAGRAM_STATUS_BLOCKED:
@@ -397,6 +416,10 @@ int QuicChromiumClientStream::Handle::WriteDatagramCapsule(
   ScopedBoolSaver saver(&may_invoke_callbacks_, false);
   if (!stream_) {
     return net_error_;
+  }
+  // QUIC would drop the data of a reset write side without a word.
+  if (stream_->write_side_closed()) {
+    return ERR_CONNECTION_CLOSED;
   }
   stream_->WriteCapsule(quiche::Capsule::Datagram(payload));
   // Writing may have closed the stream.
@@ -573,6 +596,7 @@ void QuicChromiumClientStream::Handle::SaveState() {
   ietf_application_error_ = stream_->ietf_application_error();
   is_done_reading_ = stream_->IsDoneReading();
   is_first_stream_ = stream_->IsFirstStream();
+  uses_capsules_ = stream_->uses_capsules();
   stream_bytes_read_ = stream_->stream_bytes_read();
   stream_bytes_written_ = stream_->stream_bytes_written();
 }
