@@ -627,7 +627,10 @@ void DatagramStreamAdapter::OnCapsuleWritten(int rv) {
     WriteCapsules();
     return;
   }
+  // The write side was reset (STOP_SENDING), or the stream is closing: the
+  // capsule did not go out in full.
   if (state_ != State::kDone) {
+    dropped_capsules_.fetch_add(1, std::memory_order_relaxed);
     CloseWrites();
   }
   UpdateCapsuleQueue();

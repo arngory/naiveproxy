@@ -207,6 +207,7 @@ class NET_EXPORT_PRIVATE QuicChromiumClientStream
     void OnTrailingHeadersAvailable();
     void OnDataAvailable();
     void OnCanWrite();
+    void OnWriteSideReset();
     void OnClose();
     void OnError(int error);
 
@@ -307,6 +308,7 @@ class NET_EXPORT_PRIVATE QuicChromiumClientStream
   void OnFinRead() override;
   void OnClose() override;
   void OnCanWrite() override;
+  bool OnStopSending(quic::QuicResetStreamError error) override;
   size_t WriteHeaders(
       quiche::HttpHeaderBlock header_block,
       bool fin,

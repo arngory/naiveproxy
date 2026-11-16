@@ -136,6 +136,14 @@ void QuicChromiumClientStream::Handle::OnCanWrite() {
   ResetAndRun(std::move(write_callback_), OK);
 }
 
+void QuicChromiumClientStream::Handle::OnWriteSideReset() {
+  if (!write_callback_) {
+    return;
+  }
+
+  ResetAndRun(std::move(write_callback_), ERR_CONNECTION_CLOSED);
+}
+
 void QuicChromiumClientStream::Handle::OnClose() {
   if (net_error_ == ERR_UNEXPECTED) {
     if (stream_error() == quic::QUIC_STREAM_NO_ERROR &&
@@ -799,6 +807,17 @@ void QuicChromiumClientStream::OnCanWrite() {
 
   if (!HasBufferedData() && handle_)
     handle_->OnCanWrite();
+}
+
+bool QuicChromiumClientStream::OnStopSending(quic::QuicResetStreamError error) {
+  const bool rv = quic::QuicSpdyStream::OnStopSending(error);
+  // A capsule left in the send buffer of the reset write side is never sent,
+  // and OnCanWrite() never comes for it: its write fails now. Other streams
+  // keep waiting as before, for the response or the close.
+  if (uses_capsules() && write_side_closed() && handle_) {
+    handle_->OnWriteSideReset();
+  }
+  return rv;
 }
 
 size_t QuicChromiumClientStream::WriteHeaders(
