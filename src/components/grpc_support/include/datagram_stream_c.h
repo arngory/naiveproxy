@@ -22,6 +22,13 @@ extern "C" {
  * sends and strips it from those it receives, dropping datagrams with another
  * Context ID. A payload that does not fit in a QUIC datagram goes in a DATAGRAM
  * capsule on the request stream, if the caller allows it.
+ *
+ * The capsules received are parsed by QUICHE: DATAGRAM capsules, and the
+ * legacy datagram capsule types of earlier drafts (0xff37a0, 0xff37a5), carry
+ * datagrams; capsules of unknown types are skipped, and so are the address,
+ * route and compression capsules. A CLOSE_WEBTRANSPORT_SESSION or
+ * DRAIN_WEBTRANSPORT_SESSION capsule, or one that does not parse, resets the
+ * stream (on_failed()).
  */
 
 /* Opaque object representing a datagram stream. */
@@ -78,9 +85,11 @@ typedef struct datagram_stream_callback {
 #define DATAGRAM_STREAM_QUEUE_FULL -1
 /* The payload does not fit in a QUIC datagram and capsules are not allowed,
  * or it is longer than any capsule may be. Until on_ready() with status 200
- * nothing fits in a QUIC datagram. */
+ * nothing fits in a QUIC datagram. Also for a negative |length|, or a null
+ * |data| with a |length| above 0. */
 #define DATAGRAM_STREAM_TOO_LARGE -2
-/* The stream has not started, or has ended. */
+/* The stream has not started, has ended or been canceled, or the server
+ * stopped reading it (STOP_SENDING). */
 #define DATAGRAM_STREAM_CLOSED -3
 /* The payload needs a capsule while the oldest capsule not yet sent, in the
  * send buffer of the stream or queued for it, has waited longer than 100 ms. */
@@ -132,14 +141,19 @@ int datagram_stream_send(datagram_stream* stream,
 GRPC_SUPPORT_EXPORT
 int datagram_stream_max_payload(datagram_stream* stream);
 
-/* Returns the number of capsules dropped after waiting 100 ms for the stream.
- * Can be called from any thread.
+/* Returns the number of datagrams dropped after datagram_stream_send() took
+ * them: capsules that waited 100 ms for the stream, capsules over a full queue
+ * or behind a write side the server stopped reading, and datagrams that no
+ * longer fit in a QUIC datagram when capsules were not allowed. Can be called
+ * from any thread.
  */
 GRPC_SUPPORT_EXPORT
 uint64_t datagram_stream_dropped_capsules(datagram_stream* stream);
 
-/* Cancels the stream. on_canceled() is invoked when the cancelation is
- * complete, unless the stream has not started or has already ended.
+/* Cancels the stream. Once datagram_stream_start() has returned 0,
+ * on_canceled() follows, also when the cancel comes before the request is
+ * sent, unless the stream has already ended. A cancel before
+ * datagram_stream_start() makes it return -1, with no callback.
  */
 GRPC_SUPPORT_EXPORT
 void datagram_stream_cancel(datagram_stream* stream);
