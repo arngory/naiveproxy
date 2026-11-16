@@ -12,6 +12,7 @@
 #include "base/memory/raw_ptr.h"
 #include "base/task/single_thread_task_runner.h"
 #include "base/timer/timer.h"
+#include "net/base/net_errors.h"
 #include "net/http/bidirectional_stream_request_info.h"
 #include "net/http/http_util.h"
 #include "net/socket/next_proto.h"
@@ -21,6 +22,10 @@
 
 namespace net {
 namespace {
+// The most HTTP Datagrams kept while the initial headers that came with them
+// wait to be delivered.
+constexpr size_t kMaxEarlyDatagrams = 16;
+
 // Sets a boolean to a value, and restores it to the previous value once
 // the saver goes out of scope.
 class ScopedBoolSaver {
@@ -69,6 +74,49 @@ void BidirectionalStreamQuicImpl::Start(
   delegate_ = delegate;
   request_info_ = request_info;
 
+  if (request_info_->method == "CONNECT") {
+    connect_protocol_ =
+        request_info_->extra_headers.GetHeader("-connect-protocol");
+  }
+  http_datagrams_ = connect_protocol_ == "connect-udp";
+  if (http_datagrams_) {
+    // connect-udp needs HTTP/3 datagrams and extended CONNECT, which the
+    // SETTINGS of the server announce: a server without them gets no request.
+    int rv = session_->WaitForSettings(
+        base::BindOnce(&BidirectionalStreamQuicImpl::OnSettingsReceived,
+                       weak_factory_.GetWeakPtr(), traffic_annotation));
+    if (rv != ERR_IO_PENDING) {
+      base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+          FROM_HERE,
+          base::BindOnce(&BidirectionalStreamQuicImpl::OnSettingsReceived,
+                         weak_factory_.GetWeakPtr(), traffic_annotation, rv));
+    }
+    return;
+  }
+
+  RequestStream(traffic_annotation);
+}
+
+void BidirectionalStreamQuicImpl::OnSettingsReceived(
+    const NetworkTrafficAnnotationTag& traffic_annotation,
+    int rv) {
+  if (rv == OK && !session_->IsConnected()) {
+    rv = ERR_CONNECTION_CLOSED;
+  }
+  if (rv == OK && !session_->SupportsH3DatagramAndExtendedConnect()) {
+    rv = ERR_METHOD_NOT_SUPPORTED;
+  }
+  if (rv != OK) {
+    NotifyError(rv);
+    return;
+  }
+
+  ScopedBoolSaver saver(&may_invoke_callbacks_, false);
+  RequestStream(traffic_annotation);
+}
+
+void BidirectionalStreamQuicImpl::RequestStream(
+    const NetworkTrafficAnnotationTag& traffic_annotation) {
   // Only allow SAFE methods to use early data, unless overridden by the caller.
   bool use_early_data = HttpUtil::IsMethodSafe(request_info_->method);
   use_early_data |= request_info_->allow_early_data_override;
@@ -115,8 +163,14 @@ int BidirectionalStreamQuicImpl::WriteHeaders() {
   http_request_info.method = request_info_->method;
   http_request_info.extra_headers = request_info_->extra_headers;
 
-  CreateSpdyHeadersFromHttpRequest(http_request_info, std::nullopt,
-                                   http_request_info.extra_headers, &headers);
+  if (connect_protocol_) {
+    CreateSpdyHeadersFromHttpRequestForExtendedConnect(
+        http_request_info, std::nullopt, *connect_protocol_,
+        http_request_info.extra_headers, &headers);
+  } else {
+    CreateSpdyHeadersFromHttpRequest(http_request_info, std::nullopt,
+                                     http_request_info.extra_headers, &headers);
+  }
   int rv = stream_->WriteHeaders(std::move(headers),
                                  request_info_->end_stream_on_headers, nullptr);
   if (rv >= 0) {
@@ -237,6 +291,57 @@ void BidirectionalStreamQuicImpl::PopulateNetErrorDetails(
     details->quic_connection_error = stream_->connection_error();
 }
 
+int BidirectionalStreamQuicImpl::SendHttp3Datagram(std::string_view payload) {
+  if (!http_datagrams_) {
+    return ERR_NOT_IMPLEMENTED;
+  }
+  if (!stream_) {
+    return ERR_UNEXPECTED;
+  }
+  return stream_->SendHttp3Datagram(payload);
+}
+
+int BidirectionalStreamQuicImpl::WriteDatagramCapsule(
+    std::string_view payload,
+    CompletionOnceCallback callback) {
+  if (!http_datagrams_) {
+    return ERR_NOT_IMPLEMENTED;
+  }
+  if (!stream_ || !has_sent_headers_) {
+    return ERR_UNEXPECTED;
+  }
+  return stream_->WriteDatagramCapsule(payload, std::move(callback));
+}
+
+size_t BidirectionalStreamQuicImpl::GetMaxDatagramPayload() const {
+  if (!http_datagrams_ || !stream_) {
+    return 0;
+  }
+  return stream_->GetMaxDatagramSize();
+}
+
+void BidirectionalStreamQuicImpl::OnHttp3Datagram(quic::QuicStreamId stream_id,
+                                                  std::string_view payload) {
+  if (!delegate_) {
+    return;
+  }
+  if (!initial_headers_delivered_) {
+    // The initial headers reach the delegate from a posted task, and the
+    // capsules that came with them are parsed at once.
+    if (early_datagrams_.size() < kMaxEarlyDatagrams) {
+      early_datagrams_.emplace_back(payload);
+    }
+    return;
+  }
+  delegate_->OnHttp3Datagram(payload);
+}
+
+void BidirectionalStreamQuicImpl::OnUnknownCapsule(
+    quic::QuicStreamId stream_id,
+    const quiche::UnknownCapsule& capsule) {
+  // Capsules of an unknown type are skipped (RFC 9297, section 3.2).
+}
+
 void BidirectionalStreamQuicImpl::OnStreamReady(int rv) {
   DCHECK_NE(ERR_IO_PENDING, rv);
   DCHECK(!stream_);
@@ -251,6 +356,11 @@ void BidirectionalStreamQuicImpl::OnStreamReady(int rv) {
   if (!stream_->IsOpen()) {
     NotifyError(ERR_CONNECTION_CLOSED);
     return;
+  }
+
+  if (http_datagrams_) {
+    // Before anything is read: the body of the response is read as capsules.
+    stream_->RegisterHttp3DatagramVisitor(this);
   }
 
   base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
@@ -288,8 +398,25 @@ void BidirectionalStreamQuicImpl::OnReadInitialHeadersComplete(int rv) {
       FROM_HERE,
       base::BindOnce(&BidirectionalStreamQuicImpl::ReadTrailingHeaders,
                      weak_factory_.GetWeakPtr()));
-  if (delegate_)
-    delegate_->OnHeadersReceived(initial_headers_);
+  initial_headers_delivered_ = true;
+  if (!delegate_) {
+    return;
+  }
+  base::WeakPtr<BidirectionalStreamQuicImpl> weak_this =
+      weak_factory_.GetWeakPtr();
+  delegate_->OnHeadersReceived(initial_headers_);
+  if (!weak_this) {
+    return;
+  }
+  // The HTTP Datagrams that came with the headers follow them.
+  std::vector<std::string> early_datagrams;
+  early_datagrams.swap(early_datagrams_);
+  for (const std::string& datagram : early_datagrams) {
+    if (!weak_this || !delegate_) {
+      return;
+    }
+    delegate_->OnHttp3Datagram(datagram);
+  }
 }
 
 void BidirectionalStreamQuicImpl::ReadInitialHeaders() {

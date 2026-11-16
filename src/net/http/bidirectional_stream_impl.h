@@ -8,9 +8,11 @@
 #include <stdint.h>
 
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include "base/memory/scoped_refptr.h"
+#include "net/base/completion_once_callback.h"
 #include "net/base/load_timing_info.h"
 #include "net/base/net_export.h"
 #include "net/socket/next_proto.h"
@@ -85,6 +87,12 @@ class NET_EXPORT_PRIVATE BidirectionalStreamImpl {
     // Called when an error occurred. Do not call into the stream after this
     // point. No other delegate functions will be called after this.
     virtual void OnFailed(int status) = 0;
+
+    // Called with an HTTP Datagram (RFC 9297) of a connect-udp request: the
+    // payload after the Quarter Stream ID, starting with the Context ID,
+    // whether it came in a QUIC datagram or in a DATAGRAM capsule. |payload|
+    // is valid for the duration of the call.
+    virtual void OnHttp3Datagram(std::string_view payload);
 
    protected:
     virtual ~Delegate();
@@ -163,6 +171,24 @@ class NET_EXPORT_PRIVATE BidirectionalStreamImpl {
   // Fills in |details| if it is available; leaves |details| unchanged if it
   // is unavailable.
   virtual void PopulateNetErrorDetails(NetErrorDetails* details) = 0;
+
+  // HTTP Datagrams (RFC 9297) of a connect-udp request: a CONNECT with the
+  // "-connect-protocol: connect-udp" header. Only the QUIC implementation has
+  // them; the others return ERR_NOT_IMPLEMENTED, and 0 for the size.
+  //
+  // Sends |payload| (the Context ID and what follows) in a QUIC datagram.
+  // Returns OK, ERR_MSG_TOO_BIG if it does not fit in one, which leaves the
+  // stream as it is, or another net error.
+  virtual int SendHttp3Datagram(std::string_view payload);
+
+  // Writes |payload| in a DATAGRAM capsule on the stream. Returns OK if the
+  // capsule has left the stream's send buffer, or ERR_IO_PENDING if it waits
+  // there, in which case |callback| is invoked once the buffer is empty.
+  virtual int WriteDatagramCapsule(std::string_view payload,
+                                   CompletionOnceCallback callback);
+
+  // Returns the largest |payload| that SendHttp3Datagram() sends, or 0.
+  virtual size_t GetMaxDatagramPayload() const;
 };
 
 }  // namespace net

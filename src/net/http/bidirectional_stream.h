@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include "base/compiler_specific.h"
@@ -103,6 +104,10 @@ class NET_EXPORT BidirectionalStream : public BidirectionalStreamImpl::Delegate,
     // point. No other delegate functions will be called after this.
     virtual void OnFailed(int error) = 0;
 
+    // Called with an HTTP Datagram of a connect-udp request; see
+    // BidirectionalStreamImpl::Delegate::OnHttp3Datagram().
+    virtual void OnHttp3Datagram(std::string_view payload);
+
    protected:
     virtual ~Delegate();
   };
@@ -190,6 +195,14 @@ class NET_EXPORT BidirectionalStream : public BidirectionalStreamImpl::Delegate,
   // is unavailable.
   void PopulateNetErrorDetails(NetErrorDetails* details);
 
+  // HTTP Datagrams of a connect-udp request (a CONNECT with the
+  // "-connect-protocol: connect-udp" header); see BidirectionalStreamImpl.
+  // These should not be called before Delegate::OnStreamReady is invoked.
+  int SendHttp3Datagram(std::string_view payload);
+  int WriteDatagramCapsule(std::string_view payload,
+                           CompletionOnceCallback callback);
+  size_t GetMaxDatagramPayload() const;
+
  private:
   void StartRequest();
   // BidirectionalStreamImpl::Delegate implementation:
@@ -200,6 +213,7 @@ class NET_EXPORT BidirectionalStream : public BidirectionalStreamImpl::Delegate,
   void OnDataSent() override;
   void OnTrailersReceived(const quiche::HttpHeaderBlock& trailers) override;
   void OnFailed(int error) override;
+  void OnHttp3Datagram(std::string_view payload) override;
 
   // HttpStreamRequest::Delegate implementation:
   void OnStreamReady(const ProxyInfo& used_proxy_info,

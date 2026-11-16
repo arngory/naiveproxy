@@ -25,6 +25,7 @@
 #include "net/quic/quic_chromium_client_session.h"
 #include "net/quic/quic_http_utils.h"
 #include "net/spdy/spdy_log_util.h"
+#include "net/third_party/quiche/src/quiche/common/capsule.h"
 #include "net/third_party/quiche/src/quiche/quic/core/http/quic_spdy_session.h"
 #include "net/third_party/quiche/src/quiche/quic/core/http/spdy_utils.h"
 #include "net/third_party/quiche/src/quiche/quic/core/quic_utils.h"
@@ -345,6 +346,55 @@ int QuicChromiumClientStream::Handle::WriteConnectUdpPayload(
     stream_->Reset(quic::QUIC_STREAM_CANCELLED);
     return ERR_CONNECTION_CLOSED;
   }
+}
+
+int QuicChromiumClientStream::Handle::SendHttp3Datagram(
+    std::string_view payload) {
+  ScopedBoolSaver saver(&may_invoke_callbacks_, false);
+  if (!stream_) {
+    return net_error_;
+  }
+  if (!stream_->SupportsH3Datagram()) {
+    return ERR_NOT_IMPLEMENTED;
+  }
+  switch (stream_->SendHttp3Datagram(payload)) {
+    case quic::DATAGRAM_STATUS_SUCCESS:
+    case quic::DATAGRAM_STATUS_BLOCKED:
+      return OK;
+    case quic::DATAGRAM_STATUS_TOO_LARGE:
+      return ERR_MSG_TOO_BIG;
+    case quic::DATAGRAM_STATUS_UNSUPPORTED:
+    case quic::DATAGRAM_STATUS_SETTINGS_NOT_RECEIVED:
+      return ERR_NOT_IMPLEMENTED;
+    default:
+      return ERR_FAILED;
+  }
+}
+
+int QuicChromiumClientStream::Handle::WriteDatagramCapsule(
+    std::string_view payload,
+    CompletionOnceCallback callback) {
+  ScopedBoolSaver saver(&may_invoke_callbacks_, false);
+  if (!stream_) {
+    return net_error_;
+  }
+  stream_->WriteCapsule(quiche::Capsule::Datagram(payload));
+  // Writing may have closed the stream.
+  if (!stream_) {
+    return net_error_;
+  }
+  if (!stream_->HasBufferedData()) {
+    return OK;
+  }
+  SetCallback(std::move(callback), &write_callback_);
+  return ERR_IO_PENDING;
+}
+
+size_t QuicChromiumClientStream::Handle::GetMaxDatagramSize() const {
+  if (!stream_ || !stream_->SupportsH3Datagram()) {
+    return 0;
+  }
+  return static_cast<size_t>(stream_->GetMaxDatagramSize());
 }
 
 int QuicChromiumClientStream::Handle::Read(IOBuffer* buf, int buf_len) {
@@ -678,6 +728,16 @@ void QuicChromiumClientStream::OnBodyAvailable() {
   // will be able to, potentially, read all data which has queued up.
   if (handle_)
     NotifyHandleOfDataAvailableLater();
+}
+
+void QuicChromiumClientStream::OnFinRead() {
+  quic::QuicSpdyStream::OnFinRead();
+  // With an HTTP/3 datagram visitor the body is read as capsules, which never
+  // reaches OnBodyAvailable(): the end of the body is known here, where the
+  // capsule parser closes the read side. The handle reads it as EOF.
+  if (uses_capsules() && handle_) {
+    NotifyHandleOfDataAvailableLater();
+  }
 }
 
 void QuicChromiumClientStream::OnClose() {

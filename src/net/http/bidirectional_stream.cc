@@ -63,6 +63,8 @@ BidirectionalStream::Delegate::Delegate() = default;
 
 BidirectionalStream::Delegate::~Delegate() = default;
 
+void BidirectionalStream::Delegate::OnHttp3Datagram(std::string_view payload) {}
+
 BidirectionalStream::BidirectionalStream(
     std::unique_ptr<BidirectionalStreamRequestInfo> request_info,
     HttpNetworkSession* session,
@@ -199,6 +201,28 @@ void BidirectionalStream::PopulateNetErrorDetails(NetErrorDetails* details) {
   DCHECK(details);
   if (stream_impl_)
     stream_impl_->PopulateNetErrorDetails(details);
+}
+
+int BidirectionalStream::SendHttp3Datagram(std::string_view payload) {
+  if (!stream_impl_) {
+    return ERR_UNEXPECTED;
+  }
+  return stream_impl_->SendHttp3Datagram(payload);
+}
+
+int BidirectionalStream::WriteDatagramCapsule(std::string_view payload,
+                                              CompletionOnceCallback callback) {
+  if (!stream_impl_) {
+    return ERR_UNEXPECTED;
+  }
+  return stream_impl_->WriteDatagramCapsule(payload, std::move(callback));
+}
+
+size_t BidirectionalStream::GetMaxDatagramPayload() const {
+  if (!stream_impl_) {
+    return 0;
+  }
+  return stream_impl_->GetMaxDatagramPayload();
 }
 
 void BidirectionalStream::StartRequest() {
@@ -339,6 +363,10 @@ void BidirectionalStream::OnFailed(int status) {
                                    "net_error", status);
   }
   NotifyFailed(status);
+}
+
+void BidirectionalStream::OnHttp3Datagram(std::string_view payload) {
+  delegate_->OnHttp3Datagram(payload);
 }
 
 void BidirectionalStream::OnStreamReady(const ProxyInfo& used_proxy_info,

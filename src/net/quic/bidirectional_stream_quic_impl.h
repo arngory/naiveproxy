@@ -8,6 +8,9 @@
 #include <stdint.h>
 
 #include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "base/memory/raw_ptr.h"
@@ -29,7 +32,8 @@ struct BidirectionalStreamRequestInfo;
 class IOBuffer;
 
 class NET_EXPORT_PRIVATE BidirectionalStreamQuicImpl
-    : public BidirectionalStreamImpl {
+    : public BidirectionalStreamImpl,
+      public quic::QuicSpdyStream::Http3DatagramVisitor {
  public:
   explicit BidirectionalStreamQuicImpl(
       std::unique_ptr<QuicChromiumClientSession::Handle> session);
@@ -57,8 +61,24 @@ class NET_EXPORT_PRIVATE BidirectionalStreamQuicImpl
   int64_t GetTotalSentBytes() const override;
   bool GetLoadTimingInfo(LoadTimingInfo* load_timing_info) const override;
   void PopulateNetErrorDetails(NetErrorDetails* details) override;
+  int SendHttp3Datagram(std::string_view payload) override;
+  int WriteDatagramCapsule(std::string_view payload,
+                           CompletionOnceCallback callback) override;
+  size_t GetMaxDatagramPayload() const override;
+
+  // quic::QuicSpdyStream::Http3DatagramVisitor implementation:
+  void OnHttp3Datagram(quic::QuicStreamId stream_id,
+                       std::string_view payload) override;
+  void OnUnknownCapsule(quic::QuicStreamId stream_id,
+                        const quiche::UnknownCapsule& capsule) override;
 
  private:
+  // Requests the stream from the session.
+  void RequestStream(const NetworkTrafficAnnotationTag& traffic_annotation);
+  // Called when the SETTINGS of the server have arrived, for a connect-udp
+  // request.
+  void OnSettingsReceived(const NetworkTrafficAnnotationTag& traffic_annotation,
+                          int rv);
   int WriteHeaders();
   void OnStreamReady(int rv);
   void OnSendDataComplete(int rv);
@@ -131,6 +151,16 @@ class NET_EXPORT_PRIVATE BidirectionalStreamQuicImpl
 
   // True when callbacks to the delegate may be invoked synchronously.
   bool may_invoke_callbacks_ = true;
+
+  // The :protocol of an extended CONNECT, from the "-connect-protocol" header.
+  std::optional<std::string> connect_protocol_;
+  // True for a connect-udp request: the stream carries HTTP Datagrams.
+  bool http_datagrams_ = false;
+  // True once the initial headers have been delivered to |delegate_|.
+  bool initial_headers_delivered_ = false;
+  // HTTP Datagrams that arrived with the initial headers, before these were
+  // delivered to |delegate_|.
+  std::vector<std::string> early_datagrams_;
 
   base::WeakPtrFactory<BidirectionalStreamQuicImpl> weak_factory_{this};
 };

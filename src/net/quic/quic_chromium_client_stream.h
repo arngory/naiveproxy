@@ -107,6 +107,25 @@ class NET_EXPORT_PRIVATE QuicChromiumClientStream
     // packet and sending the datagram on the stream.
     int WriteConnectUdpPayload(std::string_view packet);
 
+    // Sends |payload| (the Context ID and what follows) in an HTTP/3
+    // datagram. Unlike WriteConnectUdpPayload(), a payload that does not fit
+    // in a QUIC datagram leaves the stream as it is. Returns OK if the
+    // datagram was sent or queued, ERR_MSG_TOO_BIG if it does not fit,
+    // ERR_NOT_IMPLEMENTED if the session has no HTTP/3 datagrams, or another
+    // net error.
+    int SendHttp3Datagram(std::string_view payload);
+
+    // Writes |payload| in a DATAGRAM capsule on the stream. Returns OK if the
+    // capsule has left the stream's send buffer, or ERR_IO_PENDING if it waits
+    // there, and then invokes |callback| asynchronously once the buffer is
+    // empty.
+    int WriteDatagramCapsule(std::string_view payload,
+                             CompletionOnceCallback callback);
+
+    // Returns the largest payload that SendHttp3Datagram() sends now, after
+    // the Quarter Stream ID, or 0 if the session has no HTTP/3 datagrams.
+    size_t GetMaxDatagramSize() const;
+
     // Reads at most |buf_len| bytes into |buf|. Returns the number of bytes
     // read.
     int Read(IOBuffer* buf, int buf_len);
@@ -276,6 +295,7 @@ class NET_EXPORT_PRIVATE QuicChromiumClientStream
       size_t frame_len,
       const quic::QuicHeaderList& header_list) override;
   void OnBodyAvailable() override;
+  void OnFinRead() override;
   void OnClose() override;
   void OnCanWrite() override;
   size_t WriteHeaders(

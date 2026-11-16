@@ -217,6 +217,11 @@ void CreateSpdyHeadersFromHttpRequest(const HttpRequestInfo& info,
       (*headers)[spdy::kHttp2AuthorityHeader] = it.value();
       continue;
     }
+    // The :protocol of an extended CONNECT, which the stream implementation
+    // passes to CreateSpdyHeadersFromHttpRequestForExtendedConnect().
+    if (info.method == "CONNECT" && name == "-connect-protocol") {
+      continue;
+    }
     if (name.empty() || name[0] == ':' || name == "connection" ||
         name == "proxy-connection" || name == "transfer-encoding" ||
         name == "host") {

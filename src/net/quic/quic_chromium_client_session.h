@@ -311,6 +311,16 @@ class NET_EXPORT_PRIVATE QuicChromiumClientSession
     // closed.
     quic::QuicPacketLength GetGuaranteedLargestMessagePayload() const;
 
+    // Waits for the SETTINGS of the server and invokes |callback| when they
+    // arrive. If they have arrived, returns OK. If the connection has already
+    // been closed, returns a net error. If the connection closes before they
+    // arrive, |callback| will be invoked with an error.
+    int WaitForSettings(CompletionOnceCallback callback);
+
+    // Returns true if the SETTINGS of the server allow HTTP/3 datagrams
+    // (RFC 9297) and extended CONNECT (RFC 9220).
+    bool SupportsH3DatagramAndExtendedConnect() const;
+
     // Returns the connection migration information diff since the
     // initialization of the Handler.
     const ConnectionMigrationInformation GetConnectionMigrationInfoSinceInit()
@@ -702,6 +712,10 @@ class NET_EXPORT_PRIVATE QuicChromiumClientSession
   // be invoked with an error.
   int WaitForHandshakeConfirmation(CompletionOnceCallback callback);
 
+  // Waits for the SETTINGS of the server, as WaitForHandshakeConfirmation()
+  // does for the handshake.
+  int WaitForSettings(CompletionOnceCallback callback);
+
   // Attempts to create a new stream.  If the stream can be
   // created immediately, returns OK.  If the open stream limit
   // has been reached, returns ERR_IO_PENDING, and |request|
@@ -765,6 +779,7 @@ class NET_EXPORT_PRIVATE QuicChromiumClientSession
       quiche::QuicheReferenceCountedPointer<quic::QuicAckListenerInterface>
           ack_listener) override;
   void OnHttp3GoAway(uint64_t id) override;
+  bool OnSettingsFrame(const quic::SettingsFrame& frame) override;
   void OnAcceptChFrameReceivedViaAlps(
       const quic::AcceptChFrame& frame) override;
   void OnOriginFrame(const quic::OriginFrame& frame) override;
@@ -1048,6 +1063,7 @@ class NET_EXPORT_PRIVATE QuicChromiumClientSession
   void CloseAllHandles(int net_error);
   void CancelAllRequests(int net_error);
   void NotifyRequestsOfConfirmation(int net_error);
+  void NotifyRequestsOfSettings(int net_error);
 
   // Probe on <network, peer_address>.
   // If <network, peer_addres> is identical to the current path, the probe
@@ -1254,6 +1270,7 @@ class NET_EXPORT_PRIVATE QuicChromiumClientSession
   HandleSet handles_;
   StreamRequestQueue stream_requests_;
   std::vector<CompletionOnceCallback> waiting_for_confirmation_callbacks_;
+  std::vector<CompletionOnceCallback> waiting_for_settings_callbacks_;
   CompletionOnceCallback callback_;
   size_t num_total_streams_ = 0;
   raw_ptr<base::SequencedTaskRunner> task_runner_;

@@ -1195,6 +1195,7 @@ QuicChromiumClientSession::~QuicChromiumClientSession() {
 
   net_log_.EndEvent(NetLogEventType::QUIC_SESSION);
   DCHECK(waiting_for_confirmation_callbacks_.empty());
+  DCHECK(waiting_for_settings_callbacks_.empty());
   DCHECK(!HasActiveRequestStreams());
   DCHECK(handles_.empty());
   if (!stream_requests_.empty()) {
@@ -1289,6 +1290,15 @@ size_t QuicChromiumClientSession::WriteHeadersOnHeadersStream(
                                          /* parent_stream_id = */ 0, weight,
                                          /* exclusive = */ false,
                                          std::move(ack_listener));
+}
+
+bool QuicChromiumClientSession::OnSettingsFrame(
+    const quic::SettingsFrame& frame) {
+  if (!quic::QuicSpdyClientSessionBase::OnSettingsFrame(frame)) {
+    return false;
+  }
+  NotifyRequestsOfSettings(OK);
+  return true;
 }
 
 void QuicChromiumClientSession::OnHttp3GoAway(uint64_t id) {
@@ -1413,6 +1423,20 @@ int QuicChromiumClientSession::WaitForHandshakeConfirmation(
   }
 
   waiting_for_confirmation_callbacks_.push_back(std::move(callback));
+  return ERR_IO_PENDING;
+}
+
+int QuicChromiumClientSession::WaitForSettings(
+    CompletionOnceCallback callback) {
+  if (!connection()->connected()) {
+    return ERR_CONNECTION_CLOSED;
+  }
+
+  if (settings_received()) {
+    return OK;
+  }
+
+  waiting_for_settings_callbacks_.push_back(std::move(callback));
   return ERR_IO_PENDING;
 }
 
@@ -2327,6 +2351,7 @@ void QuicChromiumClientSession::OnConnectionClosed(
   CloseAllHandles(ERR_UNEXPECTED);
   CancelAllRequests(ERR_CONNECTION_CLOSED);
   NotifyRequestsOfConfirmation(ERR_CONNECTION_CLOSED);
+  NotifyRequestsOfSettings(ERR_CONNECTION_CLOSED);
   NotifyFactoryOfSessionClosedLater();
 }
 
@@ -3389,6 +3414,16 @@ void QuicChromiumClientSession::NotifyRequestsOfConfirmation(int net_error) {
   }
 
   waiting_for_confirmation_callbacks_.clear();
+}
+
+void QuicChromiumClientSession::NotifyRequestsOfSettings(int net_error) {
+  // Post tasks to avoid reentrancy.
+  for (auto& callback : waiting_for_settings_callbacks_) {
+    task_runner_->PostTask(FROM_HERE,
+                           base::BindOnce(std::move(callback), net_error));
+  }
+
+  waiting_for_settings_callbacks_.clear();
 }
 
 void QuicChromiumClientSession::MaybeMigrateToDifferentPortOnPathDegrading() {
@@ -4622,6 +4657,21 @@ QuicChromiumClientSession::Handle::GetGuaranteedLargestMessagePayload() const {
     return 0;
   }
   return session_->GetGuaranteedLargestDatagramPayload();
+}
+
+int QuicChromiumClientSession::Handle::WaitForSettings(
+    CompletionOnceCallback callback) {
+  if (!session_) {
+    return ERR_CONNECTION_CLOSED;
+  }
+
+  return session_->WaitForSettings(std::move(callback));
+}
+
+bool QuicChromiumClientSession::Handle::SupportsH3DatagramAndExtendedConnect()
+    const {
+  return session_ && session_->SupportsH3Datagram() &&
+         session_->allow_extended_connect();
 }
 
 const ConnectionMigrationInformation
