@@ -1119,9 +1119,10 @@ void URLRequestContextConfig::ConfigureURLRequestContextBuilder(
   // Chrome only accepts QUIC certificates that chain to a known root, and
   // ProofVerifierChromium enforces that. An embedder that installs its own
   // certificate verifier decides itself which roots are trusted, so the
-  // check is lifted for that case. An embedder that keeps the default
-  // verifier lifts it with the "allow_unknown_cert_roots" QUIC option, read
-  // above; either one is enough, and neither turns the other off.
+  // check is lifted for that case (with the exact server certificates of the
+  // native API, each certificate is its own root). An embedder that keeps the
+  // default verifier lifts it with the "allow_unknown_cert_roots" QUIC option,
+  // read above; either one is enough, and neither turns the other off.
   if (mock_cert_verifier) {
     quic_context->params()->allow_unknown_cert_roots = true;
   }

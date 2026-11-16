@@ -5,6 +5,7 @@
 #ifndef COMPONENTS_CRONET_NATIVE_INCLUDE_CRONET_C_H_
 #define COMPONENTS_CRONET_NATIVE_INCLUDE_CRONET_C_H_
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "cronet_export.h"
@@ -41,6 +42,63 @@ CRONET_EXPORT stream_engine* Cronet_Engine_GetStreamEngine(
 // Returns nullptr if the PEM data is invalid or no valid certificates found.
 CRONET_EXPORT void* Cronet_CreateCertVerifierWithRootCerts(
     const char* pem_root_certs);
+
+// Exact server certificates: a list of EngineParams, like quic_hints and
+// public_key_pins, kept apart from cronet.idl because its entries are binary.
+//
+// An engine started with a non-empty list trusts a server certificate if and
+// only if the leaf the server presents is, byte for byte, one of the DER
+// certificates of the list. Nothing else is checked: no chain is built, no
+// host name or IP address is matched, no validity period, root store
+// (system or Chrome Root Store), revocation or Certificate Transparency is
+// consulted. The TLS handshake still proves that the server holds the
+// certificate's private key. Use it only with certificates that the
+// application distributes itself, such as the self-signed certificate of a
+// server reached by IP address.
+//
+// It applies to TLS over TCP (HTTP/1.1, HTTP/2) and to QUIC (HTTP/3) alike;
+// QUIC accepts such a certificate although it chains to no known root. A
+// match verifies with cert status 0 and as not issued by a known root; any
+// other certificate fails with ERR_CERT_AUTHORITY_INVALID (over QUIC, the
+// handshake fails).
+//
+// An empty list (the default) leaves certificate verification as it is.
+//
+// Cronet_Engine_StartWithParams() fails, and changes nothing, when the list
+// is not empty and
+// - one entry is not a DER X.509 certificate: Cronet_RESULT_ILLEGAL_ARGUMENT;
+// - public_key_pins is not empty: Cronet_RESULT_ILLEGAL_ARGUMENT. A pin can
+//   add nothing to an exact certificate, which fixes the key, and pins are
+//   only kept for host names, while these certificates are meant for
+//   addresses; with the default bypass for local trust anchors the pins
+//   would also be skipped silently;
+// - the engine has a certificate verifier of
+//   Cronet_Engine_SetMockCertVerifierForTesting():
+//   Cronet_RESULT_ILLEGAL_STATE. Only one of them can decide.
+
+// Appends a copy of the |der_len| bytes at |der|, the DER encoding of an X.509
+// certificate, to the exact server certificates of |self|. A null |der| adds
+// an empty entry, which Cronet_Engine_StartWithParams() refuses.
+CRONET_EXPORT void Cronet_EngineParams_exact_server_certificates_add(
+    Cronet_EngineParamsPtr self,
+    const uint8_t* der,
+    size_t der_len);
+
+// Returns the number of exact server certificates of |self|.
+CRONET_EXPORT uint32_t Cronet_EngineParams_exact_server_certificates_size(
+    const Cronet_EngineParamsPtr self);
+
+// Returns the DER of the exact server certificate at |index| and writes its
+// length to |der_len| if not null. The bytes belong to |self| and are valid
+// until it is changed or destroyed. Out of range: null, and a length of 0.
+CRONET_EXPORT const uint8_t* Cronet_EngineParams_exact_server_certificates_at(
+    const Cronet_EngineParamsPtr self,
+    uint32_t index,
+    size_t* der_len);
+
+// Removes all exact server certificates of |self|.
+CRONET_EXPORT void Cronet_EngineParams_exact_server_certificates_clear(
+    Cronet_EngineParamsPtr self);
 
 // Dialer callback type for custom TCP connection establishment.
 // context: User-provided context pointer passed to Cronet_Engine_SetDialer.

@@ -133,7 +133,10 @@ struct URLRequestContextConfig {
   // User-Agent request header field.
   const std::string user_agent;
 
-  // Certificate verifier for testing.
+  // Certificate verifier that replaces the default one: a test's mock, the
+  // roots of Cronet_CreateCertVerifierWithRootCerts(), or the exact server
+  // certificates of the native API. QUIC accepts the roots it trusts although
+  // they are not known ones.
   std::unique_ptr<net::CertVerifier> mock_cert_verifier;
 
   // Enable Network Quality Estimator (NQE).
@@ -342,7 +345,10 @@ struct URLRequestContextConfigBuilder {
   //    ...}, "experiment2: {"option3", "option_value3", ...}, ...}
   std::string experimental_options = "{}";
 
-  // Certificate verifier for testing.
+  // Certificate verifier that replaces the default one: a test's mock, the
+  // roots of Cronet_CreateCertVerifierWithRootCerts(), or the exact server
+  // certificates of the native API. QUIC accepts the roots it trusts although
+  // they are not known ones.
   std::unique_ptr<net::CertVerifier> mock_cert_verifier;
 
   // Enable network quality estimator.

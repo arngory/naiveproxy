@@ -8,6 +8,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include "base/compiler_specific.h"
+#include "base/containers/span.h"
 #include "base/files/file_path.h"
 #include "base/files/file_util.h"
 #include "base/functional/bind.h"
@@ -16,9 +18,11 @@
 #include "base/memory/raw_ptr.h"
 #include "base/no_destructor.h"
 #include "base/notimplemented.h"
+#include "base/strings/string_view_util.h"
 #include "build/build_config.h"
 #include "components/cronet/cronet_context.h"
 #include "components/cronet/cronet_global_state.h"
+#include "components/cronet/native/exact_server_cert_verifier.h"
 #include "components/cronet/native/generated/cronet.idl_impl_struct.h"
 #include "components/cronet/native/include/cronet_c.h"
 #include "components/cronet/native/runnables.h"
@@ -253,6 +257,29 @@ Cronet_RESULT Cronet_EngineImpl::StartWithParams(
     return CheckResult(Cronet_RESULT_ILLEGAL_STATE_ENGINE_ALREADY_STARTED);
   }
 
+  // Exact server certificates replace the certificate verifier. Checked before
+  // anything else, so that a refusal leaves the engine as it was. See
+  // cronet_c.h for why the combinations are refused.
+  std::unique_ptr<net::CertVerifier> exact_server_cert_verifier;
+  if (!params->exact_server_certificates.empty()) {
+    if (!params->public_key_pins.empty()) {
+      LOG(ERROR) << "Exact server certificates do not take public key pins.";
+      return CheckResult(Cronet_RESULT_ILLEGAL_ARGUMENT);
+    }
+    if (mock_cert_verifier_) {
+      LOG(ERROR) << "Exact server certificates replace the certificate "
+                    "verifier, and the engine already has one.";
+      return CheckResult(Cronet_RESULT_ILLEGAL_STATE);
+    }
+    exact_server_cert_verifier =
+        ExactServerCertVerifier::Create(params->exact_server_certificates);
+    if (!exact_server_cert_verifier) {
+      LOG(ERROR) << "An exact server certificate is not a DER X.509 "
+                    "certificate.";
+      return CheckResult(Cronet_RESULT_ILLEGAL_ARGUMENT);
+    }
+  }
+
   URLRequestContextConfigBuilder context_config_builder;
   context_config_builder.enable_quic = params->enable_quic;
   context_config_builder.enable_spdy = params->enable_http2;
@@ -300,8 +327,17 @@ Cronet_RESULT Cronet_EngineImpl::StartWithParams(
         params->network_thread_priority;
   }
 
-  // MockCertVerifier to use for testing purposes.
-  context_config_builder.mock_cert_verifier = std::move(mock_cert_verifier_);
+  // The certificate verifier that replaces the default one, if any: the exact
+  // server certificates, or the one of SetMockCertVerifierForTesting() (a
+  // test's mock, or the roots of Cronet_CreateCertVerifierWithRootCerts()).
+  // Either way QUIC drops its known-root requirement, which only the default
+  // verifier can meet (see URLRequestContextConfig).
+  if (exact_server_cert_verifier) {
+    context_config_builder.mock_cert_verifier =
+        std::move(exact_server_cert_verifier);
+  } else {
+    context_config_builder.mock_cert_verifier = std::move(mock_cert_verifier_);
+  }
   std::unique_ptr<URLRequestContextConfig> config =
       context_config_builder.Build();
 
@@ -617,6 +653,51 @@ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(
   cronet::Cronet_EngineImpl* engine_impl =
       static_cast<cronet::Cronet_EngineImpl*>(engine);
   engine_impl->SetUdpDialer(dialer, context, on_close);
+}
+
+CRONET_EXPORT void Cronet_EngineParams_exact_server_certificates_add(
+    Cronet_EngineParamsPtr self,
+    const uint8_t* der,
+    size_t der_len) {
+  DCHECK(self);
+  if (!der) {
+    der_len = 0;
+  }
+  // SAFETY: the caller passes |der_len| readable bytes at |der|.
+  const base::span<const uint8_t> bytes =
+      UNSAFE_BUFFERS(base::span(der, der_len));
+  self->exact_server_certificates.emplace_back(base::as_string_view(bytes));
+}
+
+CRONET_EXPORT uint32_t Cronet_EngineParams_exact_server_certificates_size(
+    const Cronet_EngineParamsPtr self) {
+  DCHECK(self);
+  return static_cast<uint32_t>(self->exact_server_certificates.size());
+}
+
+CRONET_EXPORT const uint8_t* Cronet_EngineParams_exact_server_certificates_at(
+    const Cronet_EngineParamsPtr self,
+    uint32_t index,
+    size_t* der_len) {
+  DCHECK(self);
+  if (index >= self->exact_server_certificates.size()) {
+    if (der_len) {
+      *der_len = 0;
+    }
+    return nullptr;
+  }
+  const base::span<const uint8_t> bytes =
+      base::as_byte_span(self->exact_server_certificates[index]);
+  if (der_len) {
+    *der_len = bytes.size();
+  }
+  return bytes.data();
+}
+
+CRONET_EXPORT void Cronet_EngineParams_exact_server_certificates_clear(
+    Cronet_EngineParamsPtr self) {
+  DCHECK(self);
+  self->exact_server_certificates.clear();
 }
 
 namespace {

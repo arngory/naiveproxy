@@ -95,6 +95,11 @@ struct Cronet_EngineParams {
   bool enable_public_key_pinning_bypass_for_local_trust_anchors = true;
   double network_thread_priority = std::numeric_limits<double>::quiet_NaN();
   std::string experimental_options;
+
+  // Not generated from cronet.idl, which has no type for binary data: the DER
+  // certificates of Cronet_EngineParams_exact_server_certificates_add() in
+  // cronet_c.h. Copied with the struct like the generated members.
+  std::vector<std::string> exact_server_certificates;
 };
 
 // Struct Cronet_HttpHeader.
