@@ -82,8 +82,8 @@ typedef struct datagram_stream_callback {
 #define DATAGRAM_STREAM_TOO_LARGE -2
 /* The stream has not started, or has ended. */
 #define DATAGRAM_STREAM_CLOSED -3
-/* The payload needs a capsule while the oldest capsule waiting for the stream
- * has waited longer than 100 ms. */
+/* The payload needs a capsule while the oldest capsule not yet sent, in the
+ * send buffer of the stream or queued for it, has waited longer than 100 ms. */
 #define DATAGRAM_STREAM_CAPSULE_TIMEOUT -4
 
 /* Flag of datagram_stream_send(): a payload that does not fit in a QUIC
@@ -113,9 +113,10 @@ int datagram_stream_start(datagram_stream* stream,
 
 /* Sends |length| bytes of |data| as one datagram. Can be called from any
  * thread: copies |data|, queues it for the network thread and returns at once,
- * with one of the results above. The capsule of a payload that is still
- * waiting for the stream 100 ms after it could be written is dropped and
- * counted (datagram_stream_dropped_capsules()). |flags| is 0 or
+ * with one of the results above. A capsule is written only while the send
+ * buffer of the stream is empty; one still queued 100 ms after the stream
+ * could have taken it is dropped and counted
+ * (datagram_stream_dropped_capsules()). |flags| is 0 or
  * DATAGRAM_STREAM_SEND_ALLOW_CAPSULE.
  */
 GRPC_SUPPORT_EXPORT

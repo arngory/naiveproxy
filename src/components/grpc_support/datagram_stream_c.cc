@@ -29,6 +29,7 @@
 #include "base/strings/string_split.h"
 #include "base/task/single_thread_task_runner.h"
 #include "base/time/time.h"
+#include "base/timer/timer.h"
 #include "net/base/http_user_agent_settings.h"
 #include "net/base/io_buffer.h"
 #include "net/base/net_errors.h"
@@ -171,11 +172,12 @@ class DatagramStreamAdapter final : public net::BidirectionalStream::Delegate {
   void OnEndOfStream(int rv);
 
   void QueueCapsule(std::string payload);
-  // Writes the queued capsules while the stream takes them at once, and drops
-  // those that waited too long.
+  // Drops the queued capsules that waited too long, and writes the others
+  // while the stream takes them at once.
   void WriteCapsules();
   void OnCapsuleWritten(int rv);
-  // Publishes the queue to Send().
+  // Publishes the queue to Send(). Its head is the capsule in the send buffer
+  // of the stream, if there is one, or else the oldest queued capsule.
   void UpdateCapsuleQueue();
 
   int ComputeMaxPayload() const;
@@ -210,9 +212,12 @@ class DatagramStreamAdapter final : public net::BidirectionalStream::Delegate {
   std::unique_ptr<net::BidirectionalStream> bidi_stream_;
   // The request headers are sent: capsules may follow.
   bool stream_takes_capsules_ = false;
-  // A capsule waits in the send buffer of the stream.
+  // A capsule waits in the send buffer of the stream, since that time.
   bool capsule_in_stream_ = false;
+  base::TimeTicks capsule_in_stream_since_;
   base::circular_deque<QueuedCapsule> capsules_;
+  // Drops the oldest queued capsule when it has waited too long.
+  base::OneShotTimer stale_capsule_timer_;
   scoped_refptr<net::IOBufferWithSize> read_buffer_;
 
   base::WeakPtr<DatagramStreamAdapter> weak_this_;
@@ -524,22 +529,32 @@ void DatagramStreamAdapter::QueueCapsule(std::string payload) {
 void DatagramStreamAdapter::WriteCapsules() {
   if (stream_takes_capsules_ && state_ != State::kDone) {
     const base::TimeTicks now = base::TimeTicks::Now();
+    while (!capsules_.empty() &&
+           now - capsules_.front().since >= kMaxCapsuleWait) {
+      capsules_.pop_front();
+      dropped_capsules_.fetch_add(1, std::memory_order_relaxed);
+    }
     while (!capsule_in_stream_ && !capsules_.empty()) {
       QueuedCapsule capsule = std::move(capsules_.front());
       capsules_.pop_front();
-      if (now - capsule.since > kMaxCapsuleWait) {
-        dropped_capsules_.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
       const int rv = bidi_stream_->WriteDatagramCapsule(
           capsule.payload,
           base::BindOnce(&DatagramStreamAdapter::OnCapsuleWritten, weak_this_));
       if (rv == net::ERR_IO_PENDING) {
         capsule_in_stream_ = true;
+        capsule_in_stream_since_ = capsule.since;
       } else if (rv != net::OK) {
         // The stream is closing: OnFailed() follows.
         break;
       }
+    }
+    if (capsules_.empty()) {
+      stale_capsule_timer_.Stop();
+    } else {
+      stale_capsule_timer_.Start(
+          FROM_HERE, capsules_.front().since + kMaxCapsuleWait - now,
+          base::BindOnce(&DatagramStreamAdapter::WriteCapsules,
+                         base::Unretained(this)));
     }
   }
   UpdateCapsuleQueue();
@@ -550,16 +565,22 @@ void DatagramStreamAdapter::OnCapsuleWritten(int rv) {
   capsule_in_stream_ = false;
   if (rv == net::OK) {
     WriteCapsules();
+  } else {
+    UpdateCapsuleQueue();
   }
 }
 
 void DatagramStreamAdapter::UpdateCapsuleQueue() {
   queued_capsules_.store(capsules_.size(), std::memory_order_relaxed);
-  int64_t head_since_us = 0;
-  if (!capsules_.empty() && !capsules_.front().since.is_null()) {
-    head_since_us = capsules_.front().since.since_origin().InMicroseconds();
+  base::TimeTicks head_since;
+  if (capsule_in_stream_) {
+    head_since = capsule_in_stream_since_;
+  } else if (!capsules_.empty()) {
+    head_since = capsules_.front().since;
   }
-  capsule_head_since_us_.store(head_since_us, std::memory_order_relaxed);
+  capsule_head_since_us_.store(
+      head_since.is_null() ? 0 : head_since.since_origin().InMicroseconds(),
+      std::memory_order_relaxed);
 }
 
 int DatagramStreamAdapter::ComputeMaxPayload() const {
@@ -588,6 +609,8 @@ void DatagramStreamAdapter::Finish() {
   open_.store(false, std::memory_order_release);
   max_payload_.store(0, std::memory_order_relaxed);
   capsules_.clear();
+  capsule_in_stream_ = false;
+  stale_capsule_timer_.Stop();
   UpdateCapsuleQueue();
   // Deleted asynchronously, as it may still be in use up the stack.
   PostToNetworkThread(
