@@ -707,12 +707,14 @@ void QuicChromiumClientStream::OnInitialHeadersComplete(
     return;
   }
 
-  ConsumeHeaderList();
-
   // Buffer the headers and deliver them when the handle arrives.
   initial_headers_arrived_ = true;
   initial_headers_ = std::move(header_block);
   initial_headers_frame_len_ = frame_len;
+
+  // With an HTTP/3 datagram visitor this parses the body as capsules, and can
+  // close the stream: the handle then takes the headers recorded above.
+  ConsumeHeaderList();
 
   if (handle_) {
     // The handle will be notified of the headers via a posted task.
