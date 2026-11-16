@@ -52,6 +52,17 @@ void BidirectionalStreamSpdyImpl::Start(
   delegate_ = delegate;
   timer_ = std::move(timer);
 
+  // Extended CONNECT ("-connect-protocol") is implemented over QUIC only:
+  // fail rather than send a plain CONNECT.
+  if (request_info->method == "CONNECT" &&
+      request_info->extra_headers.HasHeader("-connect-protocol")) {
+    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+        FROM_HERE,
+        base::BindOnce(&BidirectionalStreamSpdyImpl::NotifyError,
+                       weak_factory_.GetWeakPtr(), ERR_NOT_IMPLEMENTED));
+    return;
+  }
+
   if (!spdy_session_) {
     base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
         FROM_HERE,

@@ -1432,7 +1432,9 @@ int QuicChromiumClientSession::WaitForSettings(
     return ERR_CONNECTION_CLOSED;
   }
 
-  if (settings_received()) {
+  // Without HTTP/3 no SETTINGS frame comes: what there is is final.
+  if (settings_received() ||
+      !quic::VersionIsIetfQuic(connection()->transport_version())) {
     return OK;
   }
 

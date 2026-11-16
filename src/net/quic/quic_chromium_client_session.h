@@ -713,7 +713,8 @@ class NET_EXPORT_PRIVATE QuicChromiumClientSession
   int WaitForHandshakeConfirmation(CompletionOnceCallback callback);
 
   // Waits for the SETTINGS of the server, as WaitForHandshakeConfirmation()
-  // does for the handshake.
+  // does for the handshake. A session that is not HTTP/3 gets no SETTINGS
+  // frame: returns OK at once.
   int WaitForSettings(CompletionOnceCallback callback);
 
   // Attempts to create a new stream.  If the stream can be
