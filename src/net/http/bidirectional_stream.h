@@ -202,6 +202,7 @@ class NET_EXPORT BidirectionalStream : public BidirectionalStreamImpl::Delegate,
   int WriteDatagramCapsule(std::string_view payload,
                            CompletionOnceCallback callback);
   size_t GetMaxDatagramPayload() const;
+  base::ScopedClosureRunner BundleWrites();
 
  private:
   void StartRequest();

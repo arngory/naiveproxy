@@ -22,9 +22,10 @@
 
 namespace net {
 namespace {
-// The most HTTP Datagrams kept while the initial headers that came with them
-// wait to be delivered.
+// The most HTTP Datagrams, and bytes of them, kept while the initial headers
+// that came with them wait to be delivered.
 constexpr size_t kMaxEarlyDatagrams = 16;
+constexpr size_t kMaxEarlyDatagramBytes = 64 * 1024;
 
 // Sets a boolean to a value, and restores it to the previous value once
 // the saver goes out of scope.
@@ -313,6 +314,12 @@ int BidirectionalStreamQuicImpl::WriteDatagramCapsule(
   return stream_->WriteDatagramCapsule(payload, std::move(callback));
 }
 
+base::ScopedClosureRunner BidirectionalStreamQuicImpl::BundleWrites() {
+  return base::ScopedClosureRunner(base::BindOnce(
+      [](std::unique_ptr<quic::QuicConnection::ScopedPacketFlusher> bundler) {},
+      session_->CreatePacketBundler()));
+}
+
 size_t BidirectionalStreamQuicImpl::GetMaxDatagramPayload() const {
   if (!http_datagrams_ || !stream_) {
     return 0;
@@ -328,7 +335,9 @@ void BidirectionalStreamQuicImpl::OnHttp3Datagram(quic::QuicStreamId stream_id,
   if (!initial_headers_delivered_) {
     // The initial headers reach the delegate from a posted task, and the
     // capsules that came with them are parsed at once.
-    if (early_datagrams_.size() < kMaxEarlyDatagrams) {
+    if (early_datagrams_.size() < kMaxEarlyDatagrams &&
+        early_datagram_bytes_ + payload.size() <= kMaxEarlyDatagramBytes) {
+      early_datagram_bytes_ += payload.size();
       early_datagrams_.emplace_back(payload);
     }
     return;
@@ -394,10 +403,15 @@ void BidirectionalStreamQuicImpl::OnReadInitialHeadersComplete(int rv) {
   headers_bytes_received_ += rv;
   negotiated_protocol_ = NextProto::kProtoQUIC;
   connect_timing_ = session_->GetConnectTiming();
-  base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
-      FROM_HERE,
-      base::BindOnce(&BidirectionalStreamQuicImpl::ReadTrailingHeaders,
-                     weak_factory_.GetWeakPtr()));
+  // With HTTP Datagrams the body is capsules up to the end of the stream, and
+  // the delegate reads it to learn of that end: no trailers are read, which
+  // could fail on a stream already closed before the end is read.
+  if (!http_datagrams_) {
+    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
+        FROM_HERE,
+        base::BindOnce(&BidirectionalStreamQuicImpl::ReadTrailingHeaders,
+                       weak_factory_.GetWeakPtr()));
+  }
   initial_headers_delivered_ = true;
   if (!delegate_) {
     return;
@@ -411,6 +425,7 @@ void BidirectionalStreamQuicImpl::OnReadInitialHeadersComplete(int rv) {
   // The HTTP Datagrams that came with the headers follow them.
   std::vector<std::string> early_datagrams;
   early_datagrams.swap(early_datagrams_);
+  early_datagram_bytes_ = 0;
   for (const std::string& datagram : early_datagrams) {
     if (!weak_this || !delegate_) {
       return;
@@ -512,6 +527,12 @@ void BidirectionalStreamQuicImpl::NotifyFailure(
 
 void BidirectionalStreamQuicImpl::NotifyStreamReady() {
   CHECK(may_invoke_callbacks_);
+  // With HTTP Datagrams, the capsules sent before the stream was there go with
+  // the request headers.
+  std::unique_ptr<quic::QuicConnection::ScopedPacketFlusher> bundler;
+  if (http_datagrams_) {
+    bundler = session_->CreatePacketBundler();
+  }
   if (send_request_headers_automatically_) {
     int rv = WriteHeaders();
     if (rv < 0) {

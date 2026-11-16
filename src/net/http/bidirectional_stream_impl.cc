@@ -33,4 +33,8 @@ size_t BidirectionalStreamImpl::GetMaxDatagramPayload() const {
   return 0;
 }
 
+base::ScopedClosureRunner BidirectionalStreamImpl::BundleWrites() {
+  return base::ScopedClosureRunner();
+}
+
 }  // namespace net

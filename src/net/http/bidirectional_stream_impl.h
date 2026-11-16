@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include "base/functional/callback_helpers.h"
 #include "base/memory/scoped_refptr.h"
 #include "net/base/completion_once_callback.h"
 #include "net/base/load_timing_info.h"
@@ -189,6 +190,10 @@ class NET_EXPORT_PRIVATE BidirectionalStreamImpl {
 
   // Returns the largest |payload| that SendHttp3Datagram() sends, or 0.
   virtual size_t GetMaxDatagramPayload() const;
+
+  // Holds back the packets of the writes made until the returned runner goes,
+  // so that they share packets. The default holds back nothing.
+  virtual base::ScopedClosureRunner BundleWrites();
 };
 
 }  // namespace net

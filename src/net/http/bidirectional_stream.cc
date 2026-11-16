@@ -225,6 +225,13 @@ size_t BidirectionalStream::GetMaxDatagramPayload() const {
   return stream_impl_->GetMaxDatagramPayload();
 }
 
+base::ScopedClosureRunner BidirectionalStream::BundleWrites() {
+  if (!stream_impl_) {
+    return base::ScopedClosureRunner();
+  }
+  return stream_impl_->BundleWrites();
+}
+
 void BidirectionalStream::StartRequest() {
   DCHECK(!stream_request_);
   HttpRequestInfo http_request_info;

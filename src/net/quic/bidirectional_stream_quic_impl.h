@@ -65,6 +65,7 @@ class NET_EXPORT_PRIVATE BidirectionalStreamQuicImpl
   int WriteDatagramCapsule(std::string_view payload,
                            CompletionOnceCallback callback) override;
   size_t GetMaxDatagramPayload() const override;
+  base::ScopedClosureRunner BundleWrites() override;
 
   // quic::QuicSpdyStream::Http3DatagramVisitor implementation:
   void OnHttp3Datagram(quic::QuicStreamId stream_id,
@@ -159,8 +160,9 @@ class NET_EXPORT_PRIVATE BidirectionalStreamQuicImpl
   // True once the initial headers have been delivered to |delegate_|.
   bool initial_headers_delivered_ = false;
   // HTTP Datagrams that arrived with the initial headers, before these were
-  // delivered to |delegate_|.
+  // delivered to |delegate_|, and their size.
   std::vector<std::string> early_datagrams_;
+  size_t early_datagram_bytes_ = 0;
 
   base::WeakPtrFactory<BidirectionalStreamQuicImpl> weak_factory_{this};
 };
