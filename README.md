@@ -2,8 +2,7 @@
 
 > **This is a fork.** arngory/naiveproxy carries the naive stack on Chromium 158 with the Cronet C API that
 > [arngory/cronet-go](https://github.com/arngory/cronet-go) builds for [Niko](https://github.com/arngory/niko), on
-> branch `claude/clever-feynman-w0e2v1`: what is on it and who pins it is in [FORK.md](FORK.md). The rest of this
-> file is upstream's.
+> branch `niko`: what is on it and who pins it is in [FORK.md](FORK.md). The rest of this file is upstream's.
 
 NaïveProxy uses Chromium's network stack to camouflage traffic with strong censorship resistance and low detectability. Reusing Chrome's stack also ensures best practices in performance and security.
 
