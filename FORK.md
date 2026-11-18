@@ -1,9 +1,10 @@
 # arngory/naiveproxy
 
 A fork of [klzgrad/naiveproxy](https://github.com/klzgrad/naiveproxy) for the naive client of
-[Niko](https://github.com/arngory/niko). Our branch is **`claude/clever-feynman-w0e2v1`**: the naive stack on
+[Niko](https://github.com/arngory/niko). Our branch is **`niko`**: the naive stack on
 **Chromium 158.0.8127.36**, with SagerNet's Cronet C API, from which
-[arngory/cronet-go](https://github.com/arngory/cronet-go) builds libcronet (its `naiveproxy` submodule). `master` and the version branches are upstream's, as upstream has them.
+[arngory/cronet-go](https://github.com/arngory/cronet-go) builds libcronet (its `naiveproxy` submodule). `master` and
+the version branches are upstream's, as upstream has them.
 
 ## What the branch is
 
@@ -36,11 +37,13 @@ The tests of the C API changes are cronet-go's (its `test/` module runs against 
 | cronet-go source branch and `go-158` (`niko/go-158-pins`) | submodule `naiveproxy` at `89a5411` |
 | cronet-go `niko/quic-local-roots` | submodule at `46938b7` |
 
-The branch is never rewritten (no rebase, no force-push): cronet-go's pins are commits of it.
+Every pinned commit is in `niko`, which is never rewritten or deleted (no rebase, no force-push): cronet-go's pins
+are commits of it, and Niko's releases name the commit their libcronet was built from as the source of its Chromium
+code. `claude/clever-feynman-w0e2v1` is the branch the port was made on; it holds the same commits up to `02a1b88`.
 
 ## Working on it
 
-- A change goes to the branch by a pull request from a branch of its own, then cronet-go moves its submodule
+- A change goes to `niko` by a pull request from a branch of its own, then cronet-go moves its submodule
   ("Update naiveproxy") and its Build tests the libraries. Upstream's `build.yml` runs on `master` only.
 - A new Chromium version is a new branch, as 158 was made: the import, then this branch's series moved onto it.
 - Checks (`.github/workflows/checks.yml`): "Commit messages" (no bare `#N`; in a fork GitHub links a bare `#N` to
